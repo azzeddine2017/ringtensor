@@ -26,6 +26,10 @@ aPackageInfo = [
 		"README.md"
 	],
 	:ringfolderfiles = 	[
+		"bin/load/ringtensor.ring",
+		"bin/ring_tensor.dll",
+		"bin/ring_tensor.exp",
+		"bin/ring_tensor.lib",
 		"extensions/ringtensor/buildclang.sh",
 		"extensions/ringtensor/buildgcc.sh",
 		"extensions/ringtensor/buildvc.bat",
