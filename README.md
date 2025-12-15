@@ -9,6 +9,12 @@ RingTensor is a high-performance C extension for the Ring programming language, 
 *   **Stability**: Includes Numerically Stable Softmax and safe Division.
 *   **Zero-Copy Logic**: Most element-wise operations work "In-Place" to minimize memory allocation overhead.
 
+## 📦 Install
+
+```bash
+ringpm install ringtensor from Azzeddine2017
+```
+
 ## 📦 Build Instructions
 
 ### Windows (Visual Studio)
