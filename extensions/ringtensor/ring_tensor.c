@@ -1,451 +1,429 @@
 /*
 ** RingTensor Extension
-** Description: Complete implementation (No FastPro dependency)
+** Description: Implementation using Direct Memory Access (Pointers)
 ** Author: Azzeddine Remmal
 */
 
 #include "ring_tensor.h"
 
-/* --- Helper: Generic 2-List Operation --- */
-void tensor_op_generic(void *pPointer, int nOp) {
-    List *pListA, *pListB, *pRowA, *pRowB;
-    int nRows, nCols, r, c;
-    double vA, vB, res;
-
-    if (RING_API_PARACOUNT != 2) { RING_API_ERROR(RING_API_MISS2PARA); return; }
-    pListA = RING_API_GETLIST(1);
-    pListB = RING_API_GETLIST(2);
-    nRows  = ring_list_getsize(pListA);
-
-    for (r = 1; r <= nRows; r++) {
-        pRowA = ring_list_getlist(pListA, r);
-        pRowB = ring_list_getlist(pListB, r);
-        nCols = ring_list_getsize(pRowA);
-        for (c = 1; c <= nCols; c++) {
-            vA = ring_list_getdouble(pRowA, c);
-            vB = ring_list_getdouble(pRowB, c);
-            switch(nOp) {
-                case 1: res = vA + vB; break; // Add
-                case 2: res = vA - vB; break; // Sub
-                case 3: res = vA * vB; break; // Mul
-                case 4: res = (vB != 0) ? vA / vB : 0.0; break; // Div
-            }
-            ring_list_setdouble_gc(RING_API_STATE, pRowA, c, res);
+/* --- Memory Management (The Garbage Collector Hook) --- */
+void ring_tensor_free(void *pState, void *pPointer) {
+    tensor_t *t = (tensor_t *)pPointer;
+    if (t != NULL) {
+        if (t->data != NULL) {
+            free(t->data);
         }
+        free(t);
     }
-    RING_API_RETLIST(pListA);
 }
 
-RING_FUNC(ring_tensor_add)      { tensor_op_generic(pPointer, 1); }
-RING_FUNC(ring_tensor_sub)      { tensor_op_generic(pPointer, 2); }
-RING_FUNC(ring_tensor_mul_elem) { tensor_op_generic(pPointer, 3); }
-RING_FUNC(ring_tensor_div)      { tensor_op_generic(pPointer, 4); }
+/* ==================================================================== */
+/* --- 1. LIFECYCLE --------------------------------------------------- */
+/* ==================================================================== */
 
-/* --- Helper: Math Transformations (Square, Sqrt, Exp) --- */
-void tensor_math_single(void *pPointer, int nOp) {
-    List *pList, *pRow;
-    int r, c, rows, cols;
-    double v, res;
-    pList = RING_API_GETLIST(1);
-    rows = ring_list_getsize(pList);
+RING_FUNC(ring_tensor_init) {
+    int rows, cols;
+    tensor_t *t;
 
-    for (r = 1; r <= rows; r++) {
-        pRow = ring_list_getlist(pList, r);
-        cols = ring_list_getsize(pRow);
-        for (c = 1; c <= cols; c++) {
-            v = ring_list_getdouble(pRow, c);
-            switch(nOp) {
-                case 1: res = v * v; break; // Square
-                case 2: res = sqrt(v); break; // Sqrt
-                case 3: res = exp(v); break; // Exp
-            }
-            ring_list_setdouble_gc(RING_API_STATE, pRow, c, res);
-        }
+    if (RING_API_PARACOUNT != 2) {
+        RING_API_ERROR(RING_API_MISS2PARA);
+        return;
     }
-    RING_API_RETLIST(pList);
+
+    rows = (int)RING_API_GETNUMBER(1);
+    cols = (int)RING_API_GETNUMBER(2);
+    
+    // Allocate Struct
+    t = (tensor_t *)malloc(sizeof(tensor_t));
+    if (!t) { RING_API_ERROR("Malloc Failed (Struct)"); return; }
+    
+    t->rows = rows;
+    t->cols = cols;
+    t->size = rows * cols;
+    
+    // Allocate Data Array (Zero Initialized)
+    t->data = (double *)calloc(t->size, sizeof(double));
+    if (!t->data) { 
+        free(t); 
+        RING_API_ERROR("Malloc Failed (Data)"); 
+        return; 
+    }
+    
+    // Return Managed Pointer to Ring
+    RING_API_RETMANAGEDCPOINTER(t, RING_VM_POINTER_TENSOR, ring_tensor_free);
 }
 
-RING_FUNC(ring_tensor_square) { tensor_math_single(pPointer, 1); }
-RING_FUNC(ring_tensor_sqrt)   { tensor_math_single(pPointer, 2); }
-RING_FUNC(ring_tensor_exp)    { tensor_math_single(pPointer, 3); }
-
-/* --- Scalars & Fill --- */
-RING_FUNC(ring_tensor_scalar_mul) {
-    List *pList, *pRow;
-    int r, c, rows, cols;
+RING_FUNC(ring_tensor_set) {
+    tensor_t *t;
+    int r, c;
     double val;
-    pList = RING_API_GETLIST(1);
-    val   = RING_API_GETNUMBER(2);
-    rows  = ring_list_getsize(pList);
-    for (r = 1; r <= rows; r++) {
-        pRow = ring_list_getlist(pList, r);
-        cols = ring_list_getsize(pRow);
-        for (c = 1; c <= cols; c++) {
-            double v = ring_list_getdouble(pRow, c);
-            ring_list_setdouble_gc(RING_API_STATE, pRow, c, v * val);
+
+    if (RING_API_PARACOUNT != 4) return;
+    t = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    r = (int)RING_API_GETNUMBER(2);
+    c = (int)RING_API_GETNUMBER(3);
+    val = RING_API_GETNUMBER(4);
+    
+    // Safety Check (1-based index from Ring)
+    if (r < 1 || r > t->rows || c < 1 || c > t->cols) return;
+    
+    // Map to 0-based C array
+    t->data[(r-1) * t->cols + (c-1)] = val;
+}
+
+RING_FUNC(ring_tensor_get) {
+    tensor_t *t;
+    int r, c;
+
+    if (RING_API_PARACOUNT != 3) return;
+    t = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    r = (int)RING_API_GETNUMBER(2);
+    c = (int)RING_API_GETNUMBER(3);
+    
+    if (r < 1 || r > t->rows || c < 1 || c > t->cols) {
+        RING_API_RETNUMBER(0.0);
+        return;
+    }
+    
+    RING_API_RETNUMBER(t->data[(r-1) * t->cols + (c-1)]);
+}
+
+/* ==================================================================== */
+/* --- 2. ELEMENT-WISE MATH (Direct Memory Access) -------------------- */
+/* ==================================================================== */
+
+void tensor_op_elem(void *pPointer, int op) {
+    tensor_t *A, *B;
+    int i;
+
+    A = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    B = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
+    
+    if (A->size != B->size) { RING_API_ERROR("Tensor Size Mismatch"); return; }
+
+    // No Lists, No Lookups, Just Raw Speed
+    for(i=0; i<A->size; i++) {
+        switch(op) {
+            case 1: A->data[i] += B->data[i]; break;
+            case 2: A->data[i] -= B->data[i]; break;
+            case 3: A->data[i] *= B->data[i]; break;
+            case 4: A->data[i] = (B->data[i] != 0) ? A->data[i] / B->data[i] : 0.0; break;
         }
     }
-    RING_API_RETLIST(pList);
+}
+
+RING_FUNC(ring_tensor_add)      { tensor_op_elem(pPointer, 1); }
+RING_FUNC(ring_tensor_sub)      { tensor_op_elem(pPointer, 2); }
+RING_FUNC(ring_tensor_mul_elem) { tensor_op_elem(pPointer, 3); }
+RING_FUNC(ring_tensor_div)      { tensor_op_elem(pPointer, 4); }
+
+/* ==================================================================== */
+/* --- 3. SCALARS & TRANSFORMS ---------------------------------------- */
+/* ==================================================================== */
+
+RING_FUNC(ring_tensor_scalar_mul) {
+    tensor_t *A = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    double v = RING_API_GETNUMBER(2);
+    int i;
+    for(i=0; i<A->size; i++) A->data[i] *= v;
 }
 
 RING_FUNC(ring_tensor_add_scalar) {
-    List *pList, *pRow;
-    int r, c, rows, cols;
-    double val;
-    pList = RING_API_GETLIST(1);
-    val   = RING_API_GETNUMBER(2);
-    rows  = ring_list_getsize(pList);
-    for (r = 1; r <= rows; r++) {
-        pRow = ring_list_getlist(pList, r);
-        cols = ring_list_getsize(pRow);
-        for (c = 1; c <= cols; c++) {
-            double v = ring_list_getdouble(pRow, c);
-            ring_list_setdouble_gc(RING_API_STATE, pRow, c, v + val);
-        }
-    }
-    RING_API_RETLIST(pList);
+    tensor_t *A = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    double v = RING_API_GETNUMBER(2);
+    int i;
+    for(i=0; i<A->size; i++) A->data[i] += v;
 }
 
 RING_FUNC(ring_tensor_fill) {
-    List *pList, *pRow;
-    int r, c, rows, cols;
-    double val;
-    pList = RING_API_GETLIST(1);
-    val   = RING_API_GETNUMBER(2);
-    rows  = ring_list_getsize(pList);
-    for (r = 1; r <= rows; r++) {
-        pRow = ring_list_getlist(pList, r);
-        cols = ring_list_getsize(pRow);
-        for (c = 1; c <= cols; c++) {
-            ring_list_setdouble_gc(RING_API_STATE, pRow, c, val);
-        }
-    }
-    RING_API_RETLIST(pList);
+    tensor_t *A = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    double v = RING_API_GETNUMBER(2);
+    int i;
+    for(i=0; i<A->size; i++) A->data[i] = v;
 }
 
 RING_FUNC(ring_tensor_random) {
-    List *pList, *pRow;
-    int r, c, rows, cols;
-    double rnd;
-    pList = RING_API_GETLIST(1);
-    rows  = ring_list_getsize(pList);
-    
-    // Seed randomization (Ideally done once, but ensuring randomness here)
+    tensor_t *A = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    int i;
     // srand(time(NULL)); 
-
-    for (r = 1; r <= rows; r++) {
-        pRow = ring_list_getlist(pList, r);
-        cols = ring_list_getsize(pRow);
-        for (c = 1; c <= cols; c++) {
-            // Random 0.0 to 1.0
-            rnd = (double)rand() / (double)RAND_MAX;
-            ring_list_setdouble_gc(RING_API_STATE, pRow, c, rnd);
-        }
-    }
-    RING_API_RETLIST(pList);
+    for(i=0; i<A->size; i++) A->data[i] = (double)rand() / (double)RAND_MAX;
 }
 
-/* --- Matrix Ops --- */
+void tensor_transform(void *pPointer, int op) {
+    tensor_t *A = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    int i;
+    for(i=0; i<A->size; i++) {
+        switch(op) {
+            case 1: A->data[i] = A->data[i] * A->data[i]; break; // Square
+            case 2: A->data[i] = sqrt(A->data[i]); break; // Sqrt
+            case 3: A->data[i] = exp(A->data[i]); break; // Exp
+        }
+    }
+}
+
+RING_FUNC(ring_tensor_square) { tensor_transform(pPointer, 1); }
+RING_FUNC(ring_tensor_sqrt)   { tensor_transform(pPointer, 2); }
+RING_FUNC(ring_tensor_exp)    { tensor_transform(pPointer, 3); }
+
+/* ==================================================================== */
+/* --- 4. MATRIX OPS (MATMUL / TRANSPOSE) ----------------------------- */
+/* ==================================================================== */
+
+/* 
+** Optimized Matrix Multiplication 
+** Uses i-k-j loop order for Cache Locality
+*/
 RING_FUNC(ring_tensor_matmul) {
-    List *pA, *pB, *pC, *pRowA, *pRowB, *pRowC;
-    int rA, cA, rB, cB, i, j, k;
-    double sum;
+    tensor_t *A = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    tensor_t *B = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
+    tensor_t *C = (tensor_t *)RING_API_GETCPOINTER(3, RING_VM_POINTER_TENSOR);
+    
+    int rA = A->rows;
+    int cA = A->cols;
+    int cB = B->cols;
+    int i, j, k;
+    
+    if (cA != B->rows) { RING_API_ERROR("MatMul Dims Mismatch"); return; }
+    
+    // 1. Initialize Result to Zero
+    // memset is in <string.h>, but loop is safer if header missing.
+    // Optimization: Pointer loop for zeroing
+    double *ptrC = C->data;
+    int totalElements = rA * cB;
+    for(i=0; i<totalElements; i++) *ptrC++ = 0.0;
 
-    pA = RING_API_GETLIST(1);
-    pB = RING_API_GETLIST(2);
-    rA = ring_list_getsize(pA);
-    if(rA==0) return;
-    cA = ring_list_getsize(ring_list_getlist(pA, 1));
-    rB = ring_list_getsize(pB);
-    if(rB==0) return;
-    cB = ring_list_getsize(ring_list_getlist(pB, 1));
+    // 2. Initialize Pointers to Raw Data
+    double *dataA = A->data;
+    double *dataB = B->data;
+    double *dataC = C->data;
 
-    if (cA != rB) { RING_API_ERROR("MatMul Dims Mismatch"); return; }
+    // 3. Magic Loop (i-k-j) using Pointers
+    for(i = 0; i < rA; i++) {
+        // Pointer to current row in C
+        double *rowC = &dataC[i * cB]; 
+        // Pointer to current row in A
+        double *rowA = &dataA[i * cA];
+        
+        for(k = 0; k < cA; k++) {
+            // Store value from A once and reuse it
+            double valA = rowA[k]; 
+            
+            // Optimization: Skip if value is 0
+            if (valA == 0.0) continue;
 
-    pC = RING_API_NEWLISTUSINGBLOCKS2D(rA, cB);
+            // Pointer to row k in B
+            double *rowB = &dataB[k * cB];
 
-    for (i = 1; i <= rA; i++) {
-        pRowA = ring_list_getlist(pA, i);
-        pRowC = ring_list_getlist(pC, i);
-        for (j = 1; j <= cB; j++) {
-            sum = 0.0;
-            for (k = 1; k <= cA; k++) {
-                pRowB = ring_list_getlist(pB, k);
-                sum += (ring_list_getdouble(pRowA, k) * ring_list_getdouble(pRowB, j));
+            // Inner loop: Only addition and multiplication (no pointer math)
+            // This is the form that the CPU loves (SIMD Friendly)
+            for(j = 0; j < cB; j++) {
+                rowC[j] += valA * rowB[j];
             }
-            ring_list_setdouble_gc(RING_API_STATE, pRowC, j, sum);
         }
     }
-    RING_API_RETLIST(pC);
 }
 
+/* 
+** Optimized Transpose 
+** Sequential Write Optimization
+*/
 RING_FUNC(ring_tensor_transpose) {
-    List *pA, *pC, *pRowA, *pRowC;
-    int nRows, nCols, i, j;
-    pA = RING_API_GETLIST(1);
-    nRows = ring_list_getsize(pA);
-    if(nRows==0) return;
-    nCols = ring_list_getsize(ring_list_getlist(pA, 1));
-
-    pC = RING_API_NEWLISTUSINGBLOCKS2D(nCols, nRows);
-
-    for (i = 1; i <= nRows; i++) {
-        pRowA = ring_list_getlist(pA, i);
-        for (j = 1; j <= nCols; j++) {
-            double val = ring_list_getdouble(pRowA, j);
-            pRowC = ring_list_getlist(pC, j);
-            ring_list_setdouble_gc(RING_API_STATE, pRowC, i, val);
+    tensor_t *A = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    tensor_t *C = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
+    
+    int rA = A->rows;
+    int cA = A->cols;
+    int i, j;
+    
+    // Iterate over Destination rows (j) then Destination cols (i)
+    // This ensures we WRITE to 'C' sequentially, which is faster for the CPU write-buffer
+    
+    for(j = 0; j < cA; j++) {
+        for(i = 0; i < rA; i++) {
+            // Dest[j][i] = Src[i][j]
+            C->data[j * rA + i] = A->data[i * cA + j];
         }
     }
-    RING_API_RETLIST(pC);
 }
+
+/* ==================================================================== */
+/* --- 5. ACTIVATIONS ------------------------------------------------- */
+/* ==================================================================== */
+
+void tensor_act(void *pPointer, int op) {
+    tensor_t *A = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    int i;
+    double v;
+    for(i=0; i<A->size; i++) {
+        v = A->data[i];
+        switch(op) {
+            case 1: A->data[i] = 1.0 / (1.0 + exp(-v)); break; // Sigmoid
+            case 2: A->data[i] = v * (1.0 - v); break;         // SigmoidPrime
+            case 3: A->data[i] = tanh(v); break;               // Tanh
+            case 4: A->data[i] = 1.0 - (v * v); break;         // TanhPrime
+            case 5: A->data[i] = (v > 0) ? v : 0; break;       // ReLU
+            case 6: A->data[i] = (v > 0) ? 1.0 : 0.0; break;   // ReLUPrime
+        }
+    }
+}
+
+RING_FUNC(ring_tensor_sigmoid)       { tensor_act(pPointer, 1); }
+RING_FUNC(ring_tensor_sigmoid_prime) { tensor_act(pPointer, 2); }
+RING_FUNC(ring_tensor_tanh)          { tensor_act(pPointer, 3); }
+RING_FUNC(ring_tensor_tanh_prime)    { tensor_act(pPointer, 4); }
+RING_FUNC(ring_tensor_relu)          { tensor_act(pPointer, 5); }
+RING_FUNC(ring_tensor_relu_prime)    { tensor_act(pPointer, 6); }
+
+RING_FUNC(ring_tensor_softmax) {
+    tensor_t *T = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    int r, c;
+    for(r=0; r<T->rows; r++) {
+        double maxVal = -DBL_MAX;
+        int rowOff = r * T->cols;
+        // Find Max
+        for(c=0; c<T->cols; c++) if(T->data[rowOff+c] > maxVal) maxVal = T->data[rowOff+c];
+        
+        // Exp & Sum
+        double sum = 0.0;
+        for(c=0; c<T->cols; c++) {
+            T->data[rowOff+c] = exp(T->data[rowOff+c] - maxVal);
+            sum += T->data[rowOff+c];
+        }
+        // Normalize
+        for(c=0; c<T->cols; c++) {
+            if(sum!=0) T->data[rowOff+c] /= sum;
+        }
+    }
+}
+
+/* ==================================================================== */
+/* --- 6. UTILITIES & OPTIMIZERS -------------------------------------- */
+/* ==================================================================== */
 
 RING_FUNC(ring_tensor_sum) {
-    List *pList, *pRow, *pRes, *pResRow;
-    int r, c, rows, cols, axis;
-    double sum;
-
-    pList = RING_API_GETLIST(1);
-    axis  = (int)RING_API_GETNUMBER(2);
-    rows = ring_list_getsize(pList);
-    if(rows==0) return;
-    pRow = ring_list_getlist(pList, 1);
-    cols = ring_list_getsize(pRow);
-
-    if (axis == 1) { // Sum Rows -> (Rows x 1)
-        pRes = RING_API_NEWLISTUSINGBLOCKS2D(rows, 1);
-        for (r = 1; r <= rows; r++) {
-            pRow = ring_list_getlist(pList, r);
-            sum = 0.0;
-            for (c = 1; c <= cols; c++) sum += ring_list_getdouble(pRow, c);
-            pResRow = ring_list_getlist(pRes, r);
-            ring_list_setdouble_gc(RING_API_STATE, pResRow, 1, sum);
+    tensor_t *T = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    int axis = (int)RING_API_GETNUMBER(2);
+    tensor_t *R = (tensor_t *)RING_API_GETCPOINTER(3, RING_VM_POINTER_TENSOR);
+    
+    if (axis == 1) { // Sum Rows -> Result (Rows x 1)
+        for(int r=0; r<T->rows; r++) {
+            double s = 0;
+            for(int c=0; c<T->cols; c++) s += T->data[r*T->cols + c];
+            R->data[r] = s;
         }
-    } else { // Sum Cols -> (1 x Cols)
-        pRes = RING_API_NEWLISTUSINGBLOCKS2D(1, cols);
-        pResRow = ring_list_getlist(pRes, 1);
-        for (c = 1; c <= cols; c++) {
-            sum = 0.0;
-            for (r = 1; r <= rows; r++) {
-                pRow = ring_list_getlist(pList, r);
-                sum += ring_list_getdouble(pRow, c);
+    } else { // Sum Cols -> Result (1 x Cols)
+        // Reset Result first
+        for(int i=0; i<R->size; i++) R->data[i] = 0.0;
+        
+        for(int r=0; r<T->rows; r++) {
+            for(int c=0; c<T->cols; c++) {
+                R->data[c] += T->data[r*T->cols + c];
             }
-            ring_list_setdouble_gc(RING_API_STATE, pResRow, c, sum);
         }
     }
-    RING_API_RETLIST(pRes);
 }
 
 RING_FUNC(ring_tensor_mean) {
-    List *pList, *pRow;
-    int r, c, rows, cols;
-    double sum = 0.0;
-    pList = RING_API_GETLIST(1);
-    rows = ring_list_getsize(pList);
-    if(rows==0) { RING_API_RETNUMBER(0); return; }
-    cols = ring_list_getsize(ring_list_getlist(pList, 1));
-    
-    for(r=1; r<=rows; r++) {
-        pRow = ring_list_getlist(pList, r);
-        for(c=1; c<=cols; c++) sum += ring_list_getdouble(pRow, c);
-    }
-    RING_API_RETNUMBER(sum / (rows * cols));
-}
-
-/* --- Activations --- */
-// ... (Helper function same as previous response) ...
-void apply_activation(void *pPointer, int type) {
-    List *pList, *pRow;
-    int r, c, rows, cols;
-    double v, res;
-    pList = RING_API_GETLIST(1);
-    rows = ring_list_getsize(pList);
-    for (r = 1; r <= rows; r++) {
-        pRow = ring_list_getlist(pList, r);
-        cols = ring_list_getsize(pRow);
-        for (c = 1; c <= cols; c++) {
-            v = ring_list_getdouble(pRow, c);
-            switch(type) {
-                case 1: res = 1.0 / (1.0 + exp(-v)); break; // Sigmoid
-                case 2: res = v * (1.0 - v); break;         // SigmoidPrime
-                case 3: res = tanh(v); break;               // Tanh
-                case 4: res = 1.0 - (v * v); break;         // TanhPrime
-                case 5: res = (v > 0) ? v : 0; break;       // ReLU
-                case 6: res = (v > 0) ? 1.0 : 0.0; break;   // ReLUPrime
-            }
-            ring_list_setdouble_gc(RING_API_STATE, pRow, c, res);
-        }
-    }
-    RING_API_RETLIST(pList);
-}
-
-RING_FUNC(ring_tensor_sigmoid)       { apply_activation(pPointer, 1); }
-RING_FUNC(ring_tensor_sigmoid_prime) { apply_activation(pPointer, 2); }
-RING_FUNC(ring_tensor_tanh)          { apply_activation(pPointer, 3); }
-RING_FUNC(ring_tensor_tanh_prime)    { apply_activation(pPointer, 4); }
-RING_FUNC(ring_tensor_relu)          { apply_activation(pPointer, 5); }
-RING_FUNC(ring_tensor_relu_prime)    { apply_activation(pPointer, 6); }
-
-RING_FUNC(ring_tensor_softmax) {
-    List *pList, *pRow;
-    int r, c, rows, cols;
-    double maxVal, rowSum, v;
-    pList = RING_API_GETLIST(1);
-    rows = ring_list_getsize(pList);
-    for (r = 1; r <= rows; r++) {
-        pRow = ring_list_getlist(pList, r);
-        cols = ring_list_getsize(pRow);
-        maxVal = -DBL_MAX;
-        for (c = 1; c <= cols; c++) {
-            v = ring_list_getdouble(pRow, c);
-            if (v > maxVal) maxVal = v;
-        }
-        rowSum = 0.0;
-        for (c = 1; c <= cols; c++) {
-            v = exp(ring_list_getdouble(pRow, c) - maxVal);
-            ring_list_setdouble_gc(RING_API_STATE, pRow, c, v);
-            rowSum += v;
-        }
-        for (c = 1; c <= cols; c++) {
-            v = ring_list_getdouble(pRow, c);
-            if(rowSum != 0) v /= rowSum;
-            ring_list_setdouble_gc(RING_API_STATE, pRow, c, v);
-        }
-    }
-    RING_API_RETLIST(pList);
-}
-
-RING_FUNC(ring_tensor_dropout) {
-    List *pList, *pRow;
-    int r, c, rows, cols;
-    double rate, scale, rnd;
-    pList = RING_API_GETLIST(1);
-    rate = RING_API_GETNUMBER(2);
-    rows = ring_list_getsize(pList);
-    scale = 1.0 / (1.0 - rate);
-    
-    for (r = 1; r <= rows; r++) {
-        pRow = ring_list_getlist(pList, r);
-        cols = ring_list_getsize(pRow);
-        for (c = 1; c <= cols; c++) {
-            rnd = (double)rand() / (double)RAND_MAX;
-            if (rnd < rate) ring_list_setdouble_gc(RING_API_STATE, pRow, c, 0.0);
-            else {
-                double v = ring_list_getdouble(pRow, c);
-                ring_list_setdouble_gc(RING_API_STATE, pRow, c, v * scale);
-            }
-        }
-    }
-    RING_API_RETLIST(pList);
-}
-
-/* --- Optimizers --- */
-RING_FUNC(ring_tensor_update_sgd) {
-    List *pW, *pG, *rW, *rG;
-    double lr;
-    int rows, cols, r, c;
-    pW = RING_API_GETLIST(1);
-    pG = RING_API_GETLIST(2);
-    lr = RING_API_GETNUMBER(3);
-    rows = ring_list_getsize(pW);
-    for(r=1; r<=rows; r++) {
-        rW = ring_list_getlist(pW, r);
-        rG = ring_list_getlist(pG, r);
-        cols = ring_list_getsize(rW);
-        for(c=1; c<=cols; c++) {
-            double val = ring_list_getdouble(rW, c) - (lr * ring_list_getdouble(rG, c));
-            ring_list_setdouble_gc(RING_API_STATE, rW, c, val);
-        }
-    }
-}
-
-RING_FUNC(ring_tensor_update_adam) {
-    List *pW, *pG, *pM, *pV, *rW, *rG, *rM, *rV;
-    double lr, b1, b2, eps;
-    int t, rows, cols, r, c;
-    double g, m, v, m_hat, v_hat;
-
-    pW = RING_API_GETLIST(1);
-    pG = RING_API_GETLIST(2);
-    pM = RING_API_GETLIST(3);
-    pV = RING_API_GETLIST(4);
-    lr = RING_API_GETNUMBER(5);
-    b1 = RING_API_GETNUMBER(6);
-    b2 = RING_API_GETNUMBER(7);
-    eps= RING_API_GETNUMBER(8);
-    t  = (int)RING_API_GETNUMBER(9);
-
-    rows = ring_list_getsize(pW);
-    double corr1 = 1.0 - pow(b1, t);
-    double corr2 = 1.0 - pow(b2, t);
-    if(corr1==0) corr1=1e-9;
-    if(corr2==0) corr2=1e-9;
-
-    for(r=1; r<=rows; r++) {
-        rW = ring_list_getlist(pW, r);
-        rG = ring_list_getlist(pG, r);
-        rM = ring_list_getlist(pM, r);
-        rV = ring_list_getlist(pV, r);
-        cols = ring_list_getsize(rW);
-        for(c=1; c<=cols; c++) {
-            g = ring_list_getdouble(rG, c);
-            m = ring_list_getdouble(rM, c);
-            v = ring_list_getdouble(rV, c);
-            
-            m = (b1 * m) + ((1.0 - b1) * g);
-            v = (b2 * v) + ((1.0 - b2) * (g * g));
-            
-            ring_list_setdouble_gc(RING_API_STATE, rM, c, m);
-            ring_list_setdouble_gc(RING_API_STATE, rV, c, v);
-            
-            m_hat = m / corr1;
-            v_hat = v / corr2;
-            if(v_hat < 0) v_hat = 0;
-            
-            double w = ring_list_getdouble(rW, c);
-            w -= (lr * m_hat) / (sqrt(v_hat) + eps);
-            ring_list_setdouble_gc(RING_API_STATE, rW, c, w);
-        }
-    }
+    tensor_t *T = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    double sum = 0;
+    int i;
+    for(i=0; i<T->size; i++) sum += T->data[i];
+    RING_API_RETNUMBER(sum / T->size);
 }
 
 RING_FUNC(ring_tensor_argmax) {
-    List *pList, *pRow, *pRes, *pResRow;
-    int r, c, rows, cols, maxIdx;
-    double maxVal, v;
-    pList = RING_API_GETLIST(1);
-    rows = ring_list_getsize(pList);
-    pRes = RING_API_NEWLISTUSINGBLOCKS2D(rows, 1);
-    for(r=1; r<=rows; r++) {
-        pRow = ring_list_getlist(pList, r);
-        cols = ring_list_getsize(pRow);
-        maxVal = -DBL_MAX; maxIdx = 1;
-        for(c=1; c<=cols; c++) {
-            v = ring_list_getdouble(pRow, c);
-            if(v > maxVal) { maxVal = v; maxIdx = c; }
+    tensor_t *T = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    tensor_t *R = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
+    
+    for(int r=0; r<T->rows; r++) {
+        double maxVal = -DBL_MAX;
+        int maxIdx = 1;
+        for(int c=0; c<T->cols; c++) {
+            if(T->data[r*T->cols + c] > maxVal) {
+                maxVal = T->data[r*T->cols + c];
+                maxIdx = c + 1; // 1-based index for Ring
+            }
         }
-        pResRow = ring_list_getlist(pRes, r);
-        ring_list_setdouble_gc(RING_API_STATE, pResRow, 1, (double)maxIdx);
+        R->data[r] = (double)maxIdx;
     }
-    RING_API_RETLIST(pRes);
 }
 
+RING_FUNC(ring_tensor_dropout) {
+    tensor_t *T = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    double rate = RING_API_GETNUMBER(2);
+    double scale = 1.0 / (1.0 - rate);
+    int i;
+    for(i=0; i<T->size; i++) {
+        double rnd = (double)rand() / (double)RAND_MAX;
+        if(rnd < rate) T->data[i] = 0.0;
+        else T->data[i] *= scale;
+    }
+}
+
+RING_FUNC(ring_tensor_update_sgd) {
+    tensor_t *W = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    tensor_t *G = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
+    double lr = RING_API_GETNUMBER(3);
+    int i;
+    for(i=0; i<W->size; i++) W->data[i] -= (lr * G->data[i]);
+}
+
+RING_FUNC(ring_tensor_update_adam) {
+    tensor_t *W = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    tensor_t *G = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
+    tensor_t *M = (tensor_t *)RING_API_GETCPOINTER(3, RING_VM_POINTER_TENSOR);
+    tensor_t *V = (tensor_t *)RING_API_GETCPOINTER(4, RING_VM_POINTER_TENSOR);
+    
+    double lr = RING_API_GETNUMBER(5);
+    double b1 = RING_API_GETNUMBER(6);
+    double b2 = RING_API_GETNUMBER(7);
+    double eps= RING_API_GETNUMBER(8);
+    int t = (int)RING_API_GETNUMBER(9);
+    
+    double corr1 = 1.0 - pow(b1, t);
+    double corr2 = 1.0 - pow(b2, t);
+    if(corr1 == 0) corr1 = 1e-9;
+    if(corr2 == 0) corr2 = 1e-9;
+    
+    int i;
+    for(i=0; i<W->size; i++) {
+        double g = G->data[i];
+        
+        M->data[i] = (b1 * M->data[i]) + ((1.0 - b1) * g);
+        V->data[i] = (b2 * V->data[i]) + ((1.0 - b2) * g * g);
+        
+        double m_hat = M->data[i] / corr1;
+        double v_hat = V->data[i] / corr2;
+        if(v_hat < 0) v_hat = 0;
+        
+        W->data[i] -= (lr * m_hat) / (sqrt(v_hat) + eps);
+    }
+}
+
+/* --- INIT --- */
 RING_LIBINIT {
+    RING_API_REGISTER("tensor_init", ring_tensor_init);
+    RING_API_REGISTER("tensor_set", ring_tensor_set);
+    RING_API_REGISTER("tensor_get", ring_tensor_get);
+    
     RING_API_REGISTER("tensor_add", ring_tensor_add);
     RING_API_REGISTER("tensor_sub", ring_tensor_sub);
     RING_API_REGISTER("tensor_mul_elem", ring_tensor_mul_elem);
     RING_API_REGISTER("tensor_div", ring_tensor_div);
     RING_API_REGISTER("tensor_scalar_mul", ring_tensor_scalar_mul);
     RING_API_REGISTER("tensor_add_scalar", ring_tensor_add_scalar);
+    
     RING_API_REGISTER("tensor_fill", ring_tensor_fill);
     RING_API_REGISTER("tensor_random", ring_tensor_random);
     RING_API_REGISTER("tensor_square", ring_tensor_square);
     RING_API_REGISTER("tensor_sqrt", ring_tensor_sqrt);
     RING_API_REGISTER("tensor_exp", ring_tensor_exp);
-    RING_API_REGISTER("tensor_sum", ring_tensor_sum);
-    RING_API_REGISTER("tensor_mean", ring_tensor_mean);
+    
     RING_API_REGISTER("tensor_matmul", ring_tensor_matmul);
     RING_API_REGISTER("tensor_transpose", ring_tensor_transpose);
+    RING_API_REGISTER("tensor_sum", ring_tensor_sum);
+    RING_API_REGISTER("tensor_mean", ring_tensor_mean);
+    
     RING_API_REGISTER("tensor_sigmoid", ring_tensor_sigmoid);
     RING_API_REGISTER("tensor_sigmoid_prime", ring_tensor_sigmoid_prime);
     RING_API_REGISTER("tensor_tanh", ring_tensor_tanh);
@@ -453,8 +431,9 @@ RING_LIBINIT {
     RING_API_REGISTER("tensor_relu", ring_tensor_relu);
     RING_API_REGISTER("tensor_relu_prime", ring_tensor_relu_prime);
     RING_API_REGISTER("tensor_softmax", ring_tensor_softmax);
-    RING_API_REGISTER("tensor_dropout", ring_tensor_dropout);
+    
     RING_API_REGISTER("tensor_update_sgd", ring_tensor_update_sgd);
     RING_API_REGISTER("tensor_update_adam", ring_tensor_update_adam);
+    RING_API_REGISTER("tensor_dropout", ring_tensor_dropout);
     RING_API_REGISTER("tensor_argmax", ring_tensor_argmax);
 }
