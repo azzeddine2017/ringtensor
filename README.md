@@ -1,11 +1,11 @@
 
-# ⚡ RingTensor Extension (v1.2.0)
+# ⚡ RingTensor Extension (v1.2.1)
 
 **RingTensor** is a high-performance, memory-resident C extension for the Ring programming language. It serves as the low-level mathematical backend for **RingML**, providing the speed required for Deep Learning, NLP, and Transformer-based models (like GPT).
 
 > **Core Philosophy:** Zero-Copy Architecture. Data resides entirely in C memory (heaps); Ring only handles lightweight pointers. This eliminates data marshalling overhead, achieving near-C speeds.
 
-## 🚀 New in v1.2.0
+## 🚀 New in v1.2.1
 - **Multi-Core Processing (OpenMP)**: Automatically distributes heavy matrix operations across CPU cores.
 - **4D Tensor Support**: Native support for logical reshaping `[Batch, Heads, Rows, Cols]`.
 - **Batch Operations**: Specialized kernels for 3D Matrix Multiplication (`BatchMatMul`).
@@ -214,7 +214,7 @@ see "Forward Pass Complete." + nl
 ```
 
 ### 3. The GPT Engine (NLP Kernels)
-RingTensor v1.2.0 introduces specialized kernels for Transformer models (like BERT and GPT).
+RingTensor v1.2.1 introduces specialized kernels for Transformer models (like BERT and GPT).
 
 #### A. Embedding Lookup
 Converts integer tokens to dense vectors instantly.
