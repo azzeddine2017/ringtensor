@@ -1,0 +1,1219 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RingTensor | The Ultimate Reference</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&family=JetBrains+Mono:wght@400;700&display=swap"
+        rel="stylesheet">
+    <style>
+        :root {
+            /* Dark Mode (Default) */
+            --bg-body: #0f172a;
+            --bg-sidebar: #1e293b;
+            --bg-card: #1e293b;
+            --bg-card-hover: #334155;
+            --border-color: #334155;
+
+            --primary: #38bdf8;
+            /* Sky Blue */
+            --primary-glow: rgba(56, 189, 248, 0.4);
+            --secondary: #a855f7;
+            /* Purple */
+            --accent: #f43f5e;
+            /* Rose */
+
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --text-code: #e2e8f0;
+
+            --font-main: 'Inter', sans-serif;
+            --font-code: 'JetBrains Mono', monospace;
+
+            --card-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+            --card-shadow-hover: 0 10px 30px -10px rgba(0, 0, 0, 0.5);
+        }
+
+        [data-theme="light"] {
+            --bg-body: #f8fafc;
+            --bg-sidebar: #ffffff;
+            --bg-card: #ffffff;
+            --bg-card-hover: #f1f5f9;
+            --border-color: #e2e8f0;
+
+            --primary: #0284c7;
+            /* Darker Blue */
+            --primary-glow: rgba(2, 132, 199, 0.2);
+            --secondary: #9333ea;
+            --accent: #e11d48;
+
+            --text-main: #0f172a;
+            --text-muted: #64748b;
+            --text-code: #334155;
+
+            --card-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03);
+            --card-shadow-hover: 0 10px 25px -5px rgba(0, 0, 0, 0.1);
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            scroll-behavior: smooth;
+        }
+
+        body {
+            font-family: var(--font-main);
+            background-color: var(--bg-body);
+            color: var(--text-main);
+            line-height: 1.6;
+            overflow-x: hidden;
+            transition: background-color 0.3s, color 0.3s;
+        }
+
+        /* --- Scrollbar --- */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: var(--bg-body);
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--border-color);
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--primary);
+        }
+
+        /* --- Layout --- */
+        .app-container {
+            display: flex;
+            min-height: 100vh;
+        }
+
+        /* --- Sidebar --- */
+        .sidebar {
+            width: 280px;
+            background: var(--bg-sidebar);
+            border-right: 1px solid var(--border-color);
+            position: fixed;
+            height: 100vh;
+            overflow-y: auto;
+            padding: 2rem 1rem;
+            display: flex;
+            flex-direction: column;
+            z-index: 100;
+            transition: background-color 0.3s, border-color 0.3s;
+        }
+
+        .brand {
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: var(--text-main);
+            margin-bottom: 2rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .brand span {
+            color: var(--primary);
+        }
+
+        .nav-group {
+            margin-bottom: 1.5rem;
+        }
+
+        .nav-header {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-muted);
+            margin-bottom: 0.5rem;
+            font-weight: 600;
+        }
+
+        .nav-link {
+            display: block;
+            padding: 0.5rem 0.75rem;
+            color: var(--text-muted);
+            text-decoration: none;
+            border-radius: 6px;
+            transition: all 0.2s;
+            font-size: 0.9rem;
+        }
+
+        .nav-link:hover {
+            background: var(--bg-card-hover);
+            color: var(--primary);
+            transform: translateX(4px);
+        }
+
+        .nav-link.active {
+            background: rgba(56, 189, 248, 0.1);
+            color: var(--primary);
+            border-left: 3px solid var(--primary);
+        }
+
+        /* --- Main Content --- */
+        .main-content {
+            margin-left: 280px;
+            flex: 1;
+            padding: 0;
+            position: relative;
+        }
+
+        /* --- Hero Section --- */
+        .hero {
+            padding: 5rem 3rem;
+            background: radial-gradient(circle at top right, var(--primary-glow), transparent 40%),
+                radial-gradient(circle at bottom left, rgba(168, 85, 247, 0.1), transparent 40%);
+            border-bottom: 1px solid var(--border-color);
+            margin-bottom: 2rem;
+            position: relative;
+        }
+
+        .theme-toggle {
+            position: absolute;
+            top: 2rem;
+            right: 3rem;
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            color: var(--text-main);
+            padding: 0.5rem 1rem;
+            border-radius: 20px;
+            cursor: pointer;
+            font-family: var(--font-main);
+            font-size: 0.9rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            transition: all 0.2s;
+        }
+
+        .theme-toggle:hover {
+            border-color: var(--primary);
+            color: var(--primary);
+        }
+
+        .hero h1 {
+            font-size: 3.5rem;
+            font-weight: 800;
+            margin-bottom: 1rem;
+            background: linear-gradient(to right, var(--text-main), var(--text-muted));
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .hero p {
+            font-size: 1.2rem;
+            color: var(--text-muted);
+            max-width: 600px;
+        }
+
+        .hero-badge {
+            display: inline-block;
+            padding: 0.25rem 0.75rem;
+            background: rgba(56, 189, 248, 0.1);
+            color: var(--primary);
+            border: 1px solid rgba(56, 189, 248, 0.2);
+            border-radius: 20px;
+            font-size: 0.85rem;
+            margin-bottom: 1rem;
+            font-weight: 600;
+        }
+
+        /* --- Sections --- */
+        .section {
+            padding: 2rem 3rem;
+            margin-bottom: 3rem;
+            scroll-margin-top: 2rem;
+        }
+
+        .section-header {
+            display: flex;
+            align-items: center;
+            margin-bottom: 2rem;
+            padding-bottom: 1rem;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .section-title {
+            font-size: 1.8rem;
+            font-weight: 700;
+            color: var(--text-main);
+        }
+
+        .section-tag {
+            margin-left: 1rem;
+            font-size: 0.8rem;
+            padding: 0.2rem 0.6rem;
+            border-radius: 4px;
+            background: var(--bg-card-hover);
+            color: var(--text-muted);
+        }
+
+        /* --- Function Cards --- */
+        .func-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+            gap: 1.5rem;
+        }
+
+        .func-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 1.5rem;
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+            cursor: pointer;
+            box-shadow: var(--card-shadow);
+        }
+
+        .func-card:hover {
+            transform: translateY(-5px);
+            border-color: var(--primary);
+            box-shadow: var(--card-shadow-hover);
+        }
+
+        .func-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 4px;
+            background: linear-gradient(90deg, var(--primary), var(--secondary));
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+
+        .func-card:hover::before {
+            opacity: 1;
+        }
+
+        .func-name {
+            font-family: var(--font-code);
+            font-size: 1.1rem;
+            color: var(--primary);
+            margin-bottom: 0.5rem;
+            font-weight: 700;
+        }
+
+        .func-desc {
+            color: var(--text-muted);
+            font-size: 0.95rem;
+            margin-bottom: 1rem;
+            min-height: 3rem;
+        }
+
+        .func-meta {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            border-top: 1px solid var(--border-color);
+            padding-top: 1rem;
+        }
+
+        .complexity {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+        }
+
+        .complexity-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+        }
+
+        .c-green {
+            background: #4ade80;
+            box-shadow: 0 0 8px #4ade80;
+        }
+
+        .c-yellow {
+            background: #facc15;
+            box-shadow: 0 0 8px #facc15;
+        }
+
+        .c-red {
+            background: #f43f5e;
+            box-shadow: 0 0 8px #f43f5e;
+        }
+
+        .c-purple {
+            background: #a855f7;
+            box-shadow: 0 0 8px #a855f7;
+        }
+
+        .new-badge {
+            background: rgba(244, 63, 94, 0.2);
+            color: var(--accent);
+            padding: 0.1rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.7rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            margin-left: 0.5rem;
+        }
+
+        /* --- Expanded Details --- */
+        .func-details {
+            display: none;
+            margin-top: 1rem;
+            padding-top: 1.5rem;
+            border-top: 1px dashed var(--border-color);
+            animation: fadeIn 0.3s ease;
+        }
+
+        .func-card.expanded .func-details {
+            display: block;
+        }
+
+        .func-card.expanded {
+            border-color: var(--primary);
+            background: var(--bg-card-hover);
+        }
+
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(5px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .detail-label {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            color: var(--primary);
+            margin-bottom: 0.5rem;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+        }
+
+        .detail-label::before {
+            content: '›';
+            font-size: 1.2rem;
+        }
+
+        .detail-text {
+            font-size: 0.9rem;
+            color: var(--text-main);
+            margin-bottom: 1.5rem;
+            padding-left: 1rem;
+        }
+
+        /* --- Code Snippet --- */
+        .code-snippet {
+            font-family: var(--font-code);
+            background: #0a0f1e;
+            padding: 1.5rem;
+            border-radius: 12px;
+            font-size: 0.9rem;
+            color: #d1d5db;
+            margin-top: 1rem;
+            white-space: pre;
+            overflow-x: auto;
+            border: 1px solid var(--border-color);
+            line-height: 1.6;
+            box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.3);
+        }
+
+        [data-theme="light"] .code-snippet {
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            color: #334155;
+            box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.05);
+        }
+
+        /* Syntax Highlighting Colors */
+        .token-comment {
+            color: #6b7280;
+            font-style: italic;
+        }
+
+        .token-keyword {
+            color: #f472b6;
+            font-weight: 600;
+        }
+
+        .token-string {
+            color: #34d399;
+        }
+
+        .token-function {
+            color: #60a5fa;
+        }
+
+        .token-number {
+            color: #fbbf24;
+        }
+
+        .token-operator {
+            color: #94a3b8;
+        }
+
+        /* --- Story Section --- */
+        .story-container {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 3rem;
+            max-width: 900px;
+            margin: 0 auto;
+        }
+
+        .story-header {
+            text-align: center;
+            margin-bottom: 3rem;
+            border-bottom: 2px solid var(--border-color);
+            padding-bottom: 2rem;
+        }
+
+        .story-title {
+            font-size: 2.5rem;
+            font-weight: 800;
+            margin-bottom: 0.5rem;
+            color: var(--primary);
+        }
+
+        .story-author {
+            font-size: 1.1rem;
+            color: var(--text-muted);
+            font-style: italic;
+        }
+
+        .chapter {
+            margin-bottom: 3rem;
+        }
+
+        .chapter-title {
+            font-size: 1.5rem;
+            color: var(--secondary);
+            margin-bottom: 1rem;
+            font-weight: 700;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .chapter-content {
+            font-size: 1.05rem;
+            color: var(--text-main);
+            line-height: 1.8;
+        }
+
+        .chapter-content strong {
+            color: var(--primary);
+        }
+
+        .chapter-content ul {
+            margin-left: 1.5rem;
+            margin-top: 1rem;
+        }
+
+        .chapter-content li {
+            margin-bottom: 0.5rem;
+        }
+
+        /* --- Responsive --- */
+        @media (max-width: 1024px) {
+            .sidebar {
+                transform: translateX(-100%);
+                transition: transform 0.3s;
+            }
+
+            .main-content {
+                margin-left: 0;
+            }
+
+            .sidebar.open {
+                transform: translateX(0);
+            }
+
+            .hero h1 {
+                font-size: 2.5rem;
+            }
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="app-container">
+        <!-- SIDEBAR -->
+        <aside class="sidebar">
+            <div class="brand">
+                <span>⚡</span> RingTensor
+            </div>
+
+            <div class="nav-group">
+                <div class="nav-header">The Core</div>
+                <a href="#architecture" class="nav-link">Architecture</a>
+                <a href="#graph-api" class="nav-link">Graph API</a>
+                <a href="#examples" class="nav-link">Usage Examples</a>
+            </div>
+
+            <div class="nav-group">
+                <div class="nav-header">Operations</div>
+                <a href="#lifecycle" class="nav-link">Lifecycle</a>
+                <a href="#batch-ops" class="nav-link">Batch Operations</a>
+                <a href="#element-wise" class="nav-link">Element-Wise</a>
+                <a href="#transformations" class="nav-link">Transformations</a>
+                <a href="#matrix-ops" class="nav-link">Matrix Ops</a>
+            </div>
+
+            <div class="nav-group">
+                <div class="nav-header">Advanced AI</div>
+                <a href="#nlp-kernels" class="nav-link">NLP & Transformers</a>
+                <a href="#optimizers" class="nav-link">Optimizers</a>
+            </div>
+
+            <div class="nav-group">
+                <div class="nav-header">System</div>
+                <a href="#utilities" class="nav-link">Utilities</a>
+            </div>
+        </aside>
+
+        <!-- MAIN CONTENT -->
+        <main class="main-content">
+
+            <!-- HERO -->
+            <header class="hero">
+                <button class="theme-toggle" onclick="toggleTheme()">
+                    <span id="theme-icon">☀️</span> <span id="theme-text">Light Mode</span>
+                </button>
+                <div class="hero-badge">Gabriel's Architecture v2.1</div>
+                <h1>RingML Engine Reference</h1>
+                <p>High-performance, zero-copy tensor operations with an integrated **Graph Engine**. Built for
+                    Transformers, optimized for massive training throughput.</p>
+            </header>
+
+            <!-- ARCHITECTURE SECTION -->
+            <section id="architecture" class="section">
+                <div class="story-container">
+                    <div class="story-header">
+                        <h2 class="story-title">🏗️ Graph Engine Architecture</h2>
+                        <div class="story-author">Technical Deep Dive v2.1</div>
+                    </div>
+
+                    <!-- Diagram Block -->
+                    <div class="chapter">
+                        <h3 class="chapter-title">Execution Flow Diagram</h3>
+                        <div
+                            style="display: flex; flex-direction: column; align-items: center; gap: 1rem; padding: 2rem; background: rgba(0,0,0,0.2); border-radius: 12px; border: 1px solid var(--border-color);">
+                            <div
+                                style="padding: 0.8rem 1.5rem; background: var(--primary); color: #000; border-radius: 8px; font-weight: 700;">
+                                1. Graph Definition (Ring)</div>
+                            <div style="font-size: 1.5rem;">↓</div>
+                            <div
+                                style="padding: 0.8rem 1.5rem; background: var(--secondary); color: #fff; border-radius: 8px; font-weight: 700;">
+                                2. Pre-allocation & Validation (C)</div>
+                            <div style="font-size: 1.5rem;">↓</div>
+                            <div style="display: flex; gap: 2rem; align-items: center;">
+                                <div
+                                    style="padding: 1rem; border: 2px dashed var(--primary); border-radius: 12px; text-align: center;">
+                                    <div style="font-weight: 700; margin-bottom: 0.5rem;">Forward Pass</div>
+                                    <div style="font-size: 0.8rem; color: var(--text-muted);">Topological Order</div>
+                                </div>
+                                <div style="font-size: 1.5rem;">↔</div>
+                                <div
+                                    style="padding: 1rem; border: 2px dashed var(--accent); border-radius: 12px; text-align: center;">
+                                    <div style="font-weight: 700; margin-bottom: 0.5rem;">Backward Pass</div>
+                                    <div style="font-size: 0.8rem; color: var(--text-muted);">Reverse Order</div>
+                                </div>
+                            </div>
+                            <div style="font-size: 1.5rem;">↓</div>
+                            <div
+                                style="padding: 0.8rem 1.5rem; background: #4ade80; color: #000; border-radius: 8px; font-weight: 700;">
+                                3. Fused Optimizer Update (Adam/SGD)</div>
+                        </div>
+                    </div>
+
+                    <div class="chapter">
+                        <h3 class="chapter-title">The GraphNode Structure</h3>
+                        <div class="chapter-content">
+                            <p>Every operation in the graph is represented by a <code>GraphNode</code>. This structure
+                                is optimized for cache locality and minimal memory overhead.</p>
+                            <div class="code-snippet">
+    /* Graph Node Structure */
+    typedef struct GraphNode {
+        int id;
+        int opcode;
+        int src1_id;    // Index of parent node 1 (-1 if none)
+        int src2_id;    // Index of parent node 2 (-1 if none)
+        int src3_id;    // Index of parent node 3 (-1 if none)
+        
+        tensor_t *val;  // Forward Value
+        tensor_t *grad; // Backward Gradient
+        
+        int trainable;  // 1 if this is a trainable parameter
+        
+        // Optimizer State (for Adam)
+        tensor_t *m;    // First moment
+        tensor_t *v;    // Second moment
+        
+        // Parameters (Scalars)
+        double params[4];    // For operations that require a scalar parameter
+        int heads;      // For Multi-Head Attention
+        int causal;     // For Causal Masking
+        int batch;      // For Attention
+        int seq;        // For Attention
+        int attn_type;  // 0: Standard, 1: Linear Causal, 2: Linear Global
+    } GraphNode;
+                        </div>
+                    </div>
+
+                    <div class="chapter">
+                        <h3 class="chapter-title">Memory Management Strategy</h3>
+                        <div class="chapter-content">
+                            <ul>
+                                <li><strong>Static Allocation:</strong> All intermediate tensors are allocated during
+                                    <code>graph_node</code> creation. No allocations occur during the training loop.
+                                </li>
+                                <li><strong>Zero-Copy Gradients:</strong> Gradients are accumulated directly into the
+                                    <code>grad</code> tensor of each node, avoiding redundant copies.
+                                </li>
+                                <li><strong>Optimizer State Persistence:</strong> For Adam, the <code>m</code> and
+                                    <code>v</code> tensors persist across epochs, ensuring smooth convergence.
+                                </li>
+                            </ul>
+                        </div>
+                    </div>
+
+                    <div class="chapter">
+                        <h3 class="chapter-title">Optimizer Selection</h3>
+                        <div class="chapter-content">
+                            <p>The engine supports switching between optimizers globally. This affects the update step
+                                in <code>graph_run</code>.</p>
+                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 1rem;">
+                                <div
+                                    style="padding: 1rem; background: var(--bg-card-hover); border-radius: 8px; border: 1px solid var(--border-color);">
+                                    <div style="font-weight: 700; color: var(--primary);">OPTIMIZER_SGD (0)</div>
+                                    <div style="font-size: 0.85rem; color: var(--text-muted); margin-top: 0.5rem;">W = W
+                                        - LR * Grad</div>
+                                </div>
+                                <div
+                                    style="padding: 1rem; background: var(--bg-card-hover); border-radius: 8px; border: 1px solid var(--border-color);">
+                                    <div style="font-weight: 700; color: var(--secondary);">OPTIMIZER_ADAM (1)</div>
+                                    <div style="font-size: 0.85rem; color: var(--text-muted); margin-top: 0.5rem;">
+                                        Adaptive moments with bias correction.</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- USAGE EXAMPLES -->
+            <section id="examples" class="section">
+                <div class="section-header">
+                    <h2 class="section-title">Usage Examples (Ring)</h2>
+                    <span class="section-tag">Practical Implementation</span>
+                </div>
+
+                <div class="chapter">
+                    <h3 class="chapter-title">1. Simple Linear Regression Graph</h3>
+                    <div class="chapter-content">
+                        <p>This example demonstrates how to build a single-layer graph for linear regression (Y = WX +
+                            B) and train it using the Graph Engine.</p>
+                        <div class="code-snippet"><span class="token-keyword">load</span> <span
+                                class="token-string">"ringtensor.ring"</span>
+
+    <span class="token-comment"># 1. Initialize Graph</span>
+    <span class="token-function">graph_init</span>()
+
+    <span class="token-comment"># 2. Define Inputs and Weights</span>
+    x_data = <span class="token-function">tensor_init</span>(<span
+        class="token-number">1</span>, <span class="token-number">10</span>) <span
+        class="token-comment"># Input</span>
+    w_vals = <span class="token-function">tensor_init</span>(<span
+        class="token-number">10</span>, <span class="token-number">1</span>) <span
+        class="token-comment"># Weights</span>
+    y_target = <span class="token-function">tensor_init</span>(<span
+        class="token-number">1</span>, <span class="token-number">1</span>) <span
+        class="token-comment"># Target</span>
+
+    <span class="token-comment"># 3. Build Graph Nodes</span>
+    node_x = <span class="token-function">graph_node</span>(OP_INPUT, <span
+        class="token-number">0</span>, <span class="token-number">0</span>, x_data)
+    node_w = <span class="token-function">graph_node</span>(OP_WEIGHT, <span
+        class="token-number">0</span>, <span class="token-number">0</span>, w_vals)
+    node_matmul = <span class="token-function">graph_node</span>(OP_MATMUL, node_x, node_w)
+    node_target = <span class="token-function">graph_node</span>(OP_INPUT, <span
+        class="token-number">0</span>, <span class="token-number">0</span>, y_target)
+    node_loss = <span class="token-function">graph_node</span>(OP_MSE, node_matmul, node_target)
+
+    <span class="token-comment"># 4. Configure and Run Training</span>
+    <span class="token-function">graph_set_optimizer</span>(OPTIMIZER_ADAM)
+    <span class="token-function">graph_run</span>(<span class="token-number">100</span>, <span
+        class="token-number">0.01</span>, <span class="token-number">5.0</span>) <span class="token-comment"># 100 epochs, LR 0.01, cliping 5.0</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="chapter">
+                    <h3 class="chapter-title">2. Transformer Block Definition</h3>
+                    <div class="chapter-content">
+                        <p>Building a high-performance Transformer block using specialized kernels.</p>
+                        <div class="code-snippet"><span class="token-comment"># Define a Transformer-style sequence</span>
+    node_emb = <span class="token-function">graph_node</span>(OP_EMBEDDING, node_input,
+    node_w_emb)
+    node_ln = <span class="token-function">graph_node</span>(OP_LAYERNORM, node_emb, node_w_ln)
+    node_drop = <span class="token-function">graph_node</span>(OP_DROPOUT, node_ln, <span
+        class="token-number">0</span>)
+
+    <span class="token-comment"># Feed-Forward Network</span>
+    node_fc1 = <span class="token-function">graph_node</span>(OP_MATMUL, node_drop, node_w1)
+    node_relu = <span class="token-function">graph_node</span>(OP_RELU, node_fc1, <span
+        class="token-number">0</span>)
+    node_fc2 = <span class="token-function">graph_node</span>(OP_MATMUL, node_relu, node_w2)
+
+    <span class="token-comment"># Final Loss</span>
+    node_loss = <span class="token-function">graph_node</span>(OP_MSE, node_fc2, node_target)
+
+    <span class="token-function">graph_run</span>(<span class="token-number">500</span>, <span
+        class="token-number">0.001</span>, <span class="token-number">5.0</span>)
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- GRAPH ENGINE API -->
+            <section id="graph-api" class="section">
+                <div class="section-header">
+                    <h2 class="section-title">Graph Engine API</h2>
+                    <span class="section-tag">High Performance</span>
+                </div>
+                <div class="func-grid">
+                    <div class="func-card" onclick="toggleCard(this)">
+                        <div class="func-name">graph_init</div>
+                        <div class="func-desc">Initializes or resets the global computational graph.</div>
+                        <div class="code-snippet">graph_init()</div>
+                        <div class="func-meta">
+                            <div class="complexity"><span class="complexity-dot c-green"></span> O(1)</div>
+                            <span>Reset</span>
+                        </div>
+                        <div class="func-details">
+                            <div class="detail-label">Explanation</div>
+                            <p class="detail-text">Clears all existing nodes and resets the graph counter to zero. Must
+                                be called before building a new model.</p>
+                            <div class="detail-label">Ring Example</div>
+                            <div class="code-snippet"><span class="token-function">graph_init</span>() <span
+                                    class="token-comment"># Ready for a new model</span></div>
+                        </div>
+                    </div>
+                    <div class="func-card" onclick="toggleCard(this)">
+                        <div class="func-name">graph_node</div>
+                        <div class="func-desc">Creates a new node in the graph. Returns Node ID.</div>
+                        <div class="code-snippet">graph_node(opcode, src1, src2, [tensor])</div>
+                        <div class="func-meta">
+                            <div class="complexity"><span class="complexity-dot c-green"></span> O(1)</div>
+                            <span>Build</span>
+                        </div>
+                        <div class="func-details">
+                            <div class="detail-label">Explanation</div>
+                            <p class="detail-text">Adds an operation or data node to the graph. <code>src1</code> and
+                                <code>src2</code> are IDs of parent nodes. For <code>OP_INPUT</code> or
+                                <code>OP_WEIGHT</code>, pass a Tensor object.
+                            </p>
+                            <div class="detail-label">Ring Example</div>
+                            <div class="code-snippet"><span class="token-comment"># Create a weight node</span>
+w_node = <span class="token-function">graph_node</span>(OP_WEIGHT, <span
+    class="token-number">0</span>, <span class="token-number">0</span>, my_tensor)
+
+<span class="token-comment"># Create an addition node</span>
+add_node = <span class="token-function">graph_node</span>(OP_ADD, node_a, node_b)
+                            </div>
+                        </div>
+                    </div>
+                    <div class="func-card" onclick="toggleCard(this)">
+                        <div class="func-name">graph_run</div>
+                        <div class="func-desc">Runs the full training loop entirely in C.</div>
+                        <div class="code-snippet">graph_run(epochs, lr)</div>
+                        <div class="func-meta">
+                            <div class="complexity"><span class="complexity-dot c-red"></span> O(E×N)</div>
+                            <span>Train</span>
+                        </div>
+                        <div class="func-details">
+                            <div class="detail-label">Explanation</div>
+                            <p class="detail-text">Executes the training process. For each epoch, it performs a Forward
+                                pass, a Backward pass, and an Optimizer update for all trainable nodes.</p>
+                            <div class="detail-label">Ring Example</div>
+                            <div class="code-snippet"><span class="token-comment"># Train for 1000 epochs 
+    with 0.001learning rate</span>
+    <span class="token-function">graph_run</span>(<span class="token-number">1000</span>, <span class="token-number">0.001</span>)
+                            </div>
+                        </div>
+                    </div>
+                    <div class="func-card" onclick="toggleCard(this)">
+                        <div class="func-name">graph_set_optimizer</div>
+                        <div class="func-desc">Sets the optimizer: 0 (SGD) or 1 (ADAM).</div>
+                        <div class="code-snippet">graph_set_optimizer(OPTIMIZER_ADAM)</div>
+                        <div class="func-meta">
+                            <div class="complexity"><span class="complexity-dot c-green"></span> O(1)</div>
+                            <span>Config</span>
+                        </div>
+                        <div class="func-details">
+                            <div class="detail-label">Explanation</div>
+                            <p class="detail-text">Configures the global optimizer used by <code>graph_run</code>. Adam
+                                is recommended for Transformers.</p>
+                            <div class="detail-label">Ring Example</div>
+                            <div class="code-snippet"><span
+                                    class="token-function">graph_set_optimizer</span>(OPTIMIZER_ADAM)</div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 1. LIFECYCLE -->
+            <section id="lifecycle" class="section">
+                <div class="section-header">
+                    <h2 class="section-title">Lifecycle Management</h2>
+                    <span class="section-tag">Memory & Shape</span>
+                </div>
+                <div class="func-grid">
+                    <div class="func-card" onclick="toggleCard(this)">
+                        <div class="func-name">tensor_init</div>
+                        <div class="func-desc">Allocates a new tensor with specified dimensions. Zero-initialized.</div>
+                        <div class="code-snippet">tensor_init(rows, cols, [batches])</div>
+                        <div class="func-meta">
+                            <div class="complexity"><span class="complexity-dot c-green"></span> O(1)</div>
+                            <span>Alloc</span>
+                        </div>
+                        <div class="func-details">
+                            <div class="detail-label">Explanation</div>
+                            <p class="detail-text">Creates a new Tensor object. The memory is allocated on the C heap
+                                and managed by the Ring VM.</p>
+                            <div class="detail-label">Ring Example</div>
+                            <div class="code-snippet"><span class="token-comment"># Create a 100x100 matrix</span>
+t = <span class="token-function">tensor_init</span>(<span
+    class="token-number">100</span>, <span class="token-number">100</span>)</div>
+                        </div>
+                    </div>
+                    <div class="func-card" onclick="toggleCard(this)">
+                        <div class="func-name">tensor_reshape</div>
+                        <div class="func-desc">Changes the logical dimensions without moving data.</div>
+                        <div class="code-snippet">tensor_reshape(t, batch, heads, rows, cols)</div>
+                        <div class="func-meta">
+                            <div class="complexity"><span class="complexity-dot c-green"></span> O(1)</div>
+                            <span>Logical</span>
+                        </div>
+                        <div class="func-details">
+                            <div class="detail-label">Explanation</div>
+                            <p class="detail-text">Updates the shape metadata. Total elements must match. Essential for
+                                Multi-Head Attention.</p>
+                            <div class="detail-label">Ring Example</div>
+                            <div class="code-snippet"><span class="token-function">tensor_reshape</span>(t, <span
+                                    class="token-number">1</span>, <span class="token-number">8</span>, <span
+                                    class="token-number">10</span>, <span class="token-number">64</span>)</div>
+                        </div>
+                    </div>
+                    <div class="func-card" onclick="toggleCard(this)">
+                        <div class="func-name">tensor_copy</div>
+                        <div class="func-desc">Creates a deep copy of the tensor.</div>
+                        <div class="code-snippet">tensor_copy(src)</div>
+                        <div class="func-meta">
+                            <div class="complexity"><span class="complexity-dot c-yellow"></span> O(N)</div>
+                            <span>Memcpy</span>
+                        </div>
+                        <div class="func-details">
+                            <div class="detail-label">Explanation</div>
+                            <p class="detail-text">Allocates new memory and copies all data from the source tensor.</p>
+                            <div class="detail-label">Ring Example</div>
+                            <div class="code-snippet">t_new = <span class="token-function">tensor_copy</span>(t_old)
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 2. BATCH OPERATIONS -->
+            <section id="batch-ops" class="section">
+                <div class="section-header">
+                    <h2 class="section-title">Batch Operations</h2>
+                    <span class="section-tag">High Throughput</span>
+                </div>
+                <div class="func-grid">
+                    <div class="func-card" onclick="toggleCard(this)">
+                        <div class="func-name">tensor_matmul_batch</div>
+                        <div class="func-desc">Performs 3D Matrix Multiplication across batches.</div>
+                        <div class="code-snippet">tensor_matmul_batch(A, B, Out)</div>
+                        <div class="func-meta">
+                            <div class="complexity"><span class="complexity-dot c-red"></span> O(B×N³)</div>
+                            <span>Parallel</span>
+                        </div>
+                        <div class="func-details">
+                            <div class="detail-label">Explanation</div>
+                            <p class="detail-text">Multiplies matrices batch-by-batch. Parallelized with OpenMP for
+                                maximum speed.</p>
+                            <div class="detail-label">Ring Example</div>
+                            <div class="code-snippet"><span class="token-function">tensor_matmul_batch</span>(A, B, Result)</div>
+                        </div>
+                    </div>
+                    <div class="func-card" onclick="toggleCard(this)">
+                        <div class="func-name">tensor_set</div>
+                        <div class="func-desc">Sets a scalar value at (Batch, Row, Col).</div>
+                        <div class="code-snippet">tensor_set(t, b, r, c, val)</div>
+                        <div class="func-meta">
+                            <div class="complexity"><span class="complexity-dot c-green"></span> O(1)</div>
+                            <span>Write</span>
+                        </div>
+                        <div class="func-details">
+                            <div class="detail-label">Explanation</div>
+                            <p class="detail-text">Directly modifies a single element in the tensor. Indices are
+                                1-based.</p>
+                            <div class="detail-label">Ring Example</div>
+                            <div class="code-snippet"><span class="token-function">tensor_set</span>(t, <span
+                                    class="token-number">1</span>, <span class="token-number">5</span>, <span
+                                    class="token-number">2</span>, <span class="token-number">0.5</span>)</div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 3. ELEMENT-WISE -->
+            <section id="element-wise" class="section">
+                <div class="section-header">
+                    <h2 class="section-title">Element-Wise Math</h2>
+                    <span class="section-tag">In-Place & Parallel</span>
+                </div>
+                <div class="func-grid">
+                    <div class="func-card" onclick="toggleCard(this)">
+                        <div class="func-name">tensor_add</div>
+                        <div class="func-desc">Adds two tensors element-wise. A = A + B.</div>
+                        <div class="func-meta">
+                            <div class="complexity"><span class="complexity-dot c-green"></span> O(N)</div>
+                        </div>
+                        <div class="func-details">
+                            <div class="detail-label">Explanation</div>
+                            <p class="detail-text">Performs in-place addition. Both tensors must have the same size.</p>
+                            <div class="detail-label">Ring Example</div>
+                            <div class="code-snippet"><span class="token-function">tensor_add</span>(A, B)</div>
+                        </div>
+                    </div>
+                    <div class="func-card" onclick="toggleCard(this)">
+                        <div class="func-name">tensor_sub</div>
+                        <div class="func-desc">Subtracts tensor B from A element-wise. A = A - B.</div>
+                        <div class="func-meta">
+                            <div class="complexity"><span class="complexity-dot c-green"></span> O(N)</div>
+                        </div>
+                        <div class="func-details">
+                            <div class="detail-label">Explanation</div>
+                            <p class="detail-text">Performs in-place subtraction.</p>
+                            <div class="detail-label">Ring Example</div>
+                            <div class="code-snippet"><span class="token-function">tensor_sub</span>(A, B)</div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 4. TRANSFORMATIONS -->
+            <section id="transformations" class="section">
+                <div class="section-header">
+                    <h2 class="section-title">Transformations & Activations</h2>
+                    <span class="section-tag">Neural Primitives</span>
+                </div>
+                <div class="func-grid">
+                    <div class="func-card" onclick="toggleCard(this)">
+                        <div class="func-name">tensor_sigmoid</div>
+                        <div class="func-desc">Sigmoid activation function. 1 / (1 + e^-x)</div>
+                        <div class="func-details">
+                            <div class="detail-label">Explanation</div>
+                            <p class="detail-text">Applies the sigmoid function to every element in the tensor in-place.
+                            </p>
+                            <div class="detail-label">Ring Example</div>
+                            <div class="code-snippet"><span class="token-function">tensor_sigmoid</span>(t)</div>
+                        </div>
+                    </div>
+                    <div class="func-card" onclick="toggleCard(this)">
+                        <div class="func-name">tensor_relu</div>
+                        <div class="func-desc">Rectified Linear Unit. max(0, x)</div>
+                        <div class="func-details">
+                            <div class="detail-label">Explanation</div>
+                            <p class="detail-text">Applies the ReLU function in-place. Sets negative values to zero.</p>
+                            <div class="detail-label">Ring Example</div>
+                            <div class="code-snippet"><span class="token-function">tensor_relu</span>(t)</div>
+                        </div>
+                    </div>
+                    <div class="func-card" onclick="toggleCard(this)">
+                        <div class="func-name">tensor_softmax</div>
+                        <div class="func-desc">Stable Softmax function along the last dimension.</div>
+                        <div class="func-details">
+                            <div class="detail-label">Explanation</div>
+                            <p class="detail-text">Computes softmax with numerical stability. Essential for attention
+                                scores.</p>
+                            <div class="detail-label">Ring Example</div>
+                            <div class="code-snippet"><span class="token-function">tensor_softmax</span>(t)</div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 5. MATRIX OPS -->
+            <section id="matrix-ops" class="section">
+                <div class="section-header">
+                    <h2 class="section-title">Matrix Operations</h2>
+                    <span class="section-tag">Heavily Optimized</span>
+                </div>
+                <div class="func-grid">
+                    <div class="func-card" onclick="toggleCard(this)">
+                        <div class="func-name">tensor_matmul</div>
+                        <div class="func-desc">Standard Matrix Multiplication (A * B).</div>
+                        <div class="func-meta">
+                            <div class="complexity"><span class="complexity-dot c-red"></span> O(N³)</div>
+                        </div>
+                        <div class="func-details">
+                            <div class="detail-label">Explanation</div>
+                            <p class="detail-text">Computes the dot product of two matrices. Uses cache-optimized loops.
+                            </p>
+                            <div class="detail-label">Ring Example</div>
+                            <div class="code-snippet"><span class="token-function">tensor_matmul</span>(A, B, C)</div>
+                        </div>
+                    </div>
+                    <div class="func-card" onclick="toggleCard(this)">
+                        <div class="func-name">tensor_transpose</div>
+                        <div class="func-desc">Transposes the matrix (swaps rows and columns).</div>
+                        <div class="func-meta">
+                            <div class="complexity"><span class="complexity-dot c-yellow"></span> O(N²)</div>
+                        </div>
+                        <div class="func-details">
+                            <div class="detail-label">Explanation</div>
+                            <p class="detail-text">Swaps the row and column indices of the source tensor into the
+                                destination.</p>
+                            <div class="detail-label">Ring Example</div>
+                            <div class="code-snippet"><span class="token-function">tensor_transpose</span>(Src, Dest)
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 6. NLP & TRANSFORMER -->
+            <section id="nlp-kernels" class="section">
+                <div class="section-header">
+                    <h2 class="section-title">NLP & Transformer Kernels</h2>
+                    <span class="section-tag">Advanced</span>
+                </div>
+                <div class="func-grid">
+                    <div class="func-card" onclick="toggleCard(this)">
+                        <div class="func-name">tensor_embedding_forward</div>
+                        <div class="func-desc">Lookup table for token IDs to vectors.</div>
+                        <div class="func-details">
+                            <div class="detail-label">Explanation</div>
+                            <p class="detail-text">Converts a tensor of token indices into dense vectors using a weight
+                                matrix.</p>
+                            <div class="detail-label">Ring Example</div>
+                            <div class="code-snippet"><span
+                                    class="token-function">tensor_embedding_forward</span>(Indices, Weights, Output)
+                            </div>
+                        </div>
+                    </div>
+                    <div class="func-card" onclick="toggleCard(this)">
+                        <div class="func-name">tensor_layernorm</div>
+                        <div class="func-desc">Layer Normalization. Stabilizes hidden states.</div>
+                        <div class="func-details">
+                            <div class="detail-label">Explanation</div>
+                            <p class="detail-text">Normalizes the inputs across the feature dimension. Uses Gamma and
+                                Beta for scaling and shifting.</p>
+                            <div class="detail-label">Ring Example</div>
+                            <div class="code-snippet"><span class="token-function">tensor_layernorm</span>(Input, Gamma, Beta, Output, <span class="token-number">0.00001</span>)</div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 7. OPTIMIZERS -->
+            <section id="optimizers" class="section">
+                <div class="section-header">
+                    <h2 class="section-title">Optimizers</h2>
+                    <span class="section-tag">Training</span>
+                </div>
+                <div class="func-grid">
+                    <div class="func-card" onclick="toggleCard(this)">
+                        <div class="func-name">tensor_update_sgd</div>
+                        <div class="func-desc">Stochastic Gradient Descent update step.</div>
+                        <div class="func-details">
+                            <div class="detail-label">Explanation</div>
+                            <p class="detail-text">Updates weights using the formula: W = W - LR * Grad.</p>
+                            <div class="detail-label">Ring Example</div>
+                            <div class="code-snippet"><span class="token-function">tensor_update_sgd</span>(Weights, Grads, <span class="token-number">0.01</span>)</div>
+                        </div>
+                    </div>
+                    <div class="func-card" onclick="toggleCard(this)">
+                        <div class="func-name">tensor_update_adam</div>
+                        <div class="func-desc">Adam optimizer update (Adaptive Moment Estimation).</div>
+                        <div class="func-details">
+                            <div class="detail-label">Explanation</div>
+                            <p class="detail-text">Advanced optimizer that maintains per-parameter learning rates based
+                                on moments.</p>
+                            <div class="detail-label">Ring Example</div>
+                            <div class="code-snippet"><span class="token-function">tensor_update_adam</span>(W, G, M, V,
+<span class="token-number">0.001</span>, <span class="token-number">0.9</span>, <span
+class="token-number">0.999</span>, <span class="token-number">0.00000001</span>, epoch)
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <footer
+                style="text-align: center; padding: 3rem; color: var(--text-muted); border-top: 1px solid var(--border-color);">
+                <p>RingTensor Extension • Gabriel's Architecture • RingML Engine</p>
+            </footer>
+
+        </main>
+    </div>
+
+    <script>
+        function toggleCard(card) {
+            // Toggle the 'expanded' class on the clicked card
+            card.classList.toggle('expanded');
+        }
+
+        function toggleTheme() {
+            const html = document.documentElement;
+            const currentTheme = html.getAttribute('data-theme');
+            const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
+
+            html.setAttribute('data-theme', newTheme);
+
+            const icon = document.getElementById('theme-icon');
+            const text = document.getElementById('theme-text');
+
+            if (newTheme === 'light') {
+                icon.textContent = '🌙';
+                text.textContent = 'Dark Mode';
+            } else {
+                icon.textContent = '☀️';
+                text.textContent = 'Light Mode';
+            }
+        }
+    </script>
+
+</body>
+
+</html>

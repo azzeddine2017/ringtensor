@@ -5,11 +5,11 @@ aPackageInfo = [
 	:developer = "Azzeddine Remmal",
 	:email = "azzeddine.remmal@gmail.com",
 	:license = "MIT License",
-	:version = "1.2.1",
+	:version = "1.3.0",
 	:ringversion = "1.25",
 	:versions = 	[
 		[
-			:version = "1.2.1",
+			:version = "1.3.0",
 			:branch = "master"
 		]
 	],
@@ -23,6 +23,9 @@ aPackageInfo = [
 	:files = 	[
 		"main.ring",
 		"README.md",
+		"READMEv1.2.1.md",
+		"OPCODES_REFERENCE.md",
+		"ARCHITECTURE_DIAGRAM.md",
 		"setup.ring"
 	],
 	:ringfolderfiles = 	[
@@ -30,19 +33,35 @@ aPackageInfo = [
 		"bin/ring_tensor.dll",
 		"bin/ring_tensor.exp",
 		"bin/ring_tensor.lib",
+		"extensions/ringtensor/ARCHITECTURE_DIAGRAM.md",
 		"extensions/ringtensor/buildclang.sh",
 		"extensions/ringtensor/buildgcc.sh",
-		"extensions/ringtensor/buildvc.bat",
 		"extensions/ringtensor/buildvc_max_sped_x64.bat",
-		"extensions/ringtensor/buildvc_x64.bat",
+		"extensions/ringtensor/include/opencl_stub.h",
+		"extensions/ringtensor/lib/OpenCL.def",
+		"extensions/ringtensor/lib/OpenCL.exp",
+		"extensions/ringtensor/lib/OpenCL.lib",
+		"extensions/ringtensor/OPCODES_REFERENCE.md",
+		"extensions/ringtensor/OpenCL_buildvc_x64.bat",
 		"extensions/ringtensor/README.md",
-		"extensions/ringtensor/RingTensor.md",
 		"extensions/ringtensor/ringtensor.ring",
 		"extensions/ringtensor/ring_tensor.c",
 		"extensions/ringtensor/ring_tensor.h",
+		"extensions/ringtensor/testGraph/graph_engine_example.ring",
+		"extensions/ringtensor/testGraph/test_gpu.ring",
+		"extensions/ringtensor/testGraph/test_graph_backward.ring",
+		"extensions/ringtensor/testGraph/test_graph_complex.ring",
+		"extensions/ringtensor/testGraph/test_transformer_block.ring",
+		"extensions/ringtensor/tests/crypto_lwe.ring",
+		"extensions/ringtensor/tests/financial_analysis.ring",
+		"extensions/ringtensor/tests/image_filters.ring",
+		"extensions/ringtensor/tests/test_3d_physics.ring",
 		"extensions/ringtensor/tests/test_adam.ring",
 		"extensions/ringtensor/tests/test_core.ring",
 		"extensions/ringtensor/tests/test_memory.ring",
+		"extensions/ringtensor/tests/test_simple.ring",
+		"extensions/ringtensor/tests/test_sum_col.ring",
+		"extensions/ringtensor/The RingML Engine.html"
 	],
 	:windowsfiles = 	[
 

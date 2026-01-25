@@ -6,6 +6,309 @@
 
 #include "ring_tensor.h"
 
+#include <stdio.h>
+/* ==================================================================== */
+/* --- GPU ACCELERATION (OpenCL) -------------------------------------- */
+/* ==================================================================== */
+
+// Uncomment this line to enable GPU, or define it in compiler flags
+#define USE_OPENCL 1 
+
+#ifdef USE_OPENCL
+#include "opencl_stub.h"
+
+static cl_context       clContext = NULL;
+static cl_command_queue clQueue   = NULL;
+static cl_kernel        clMatMulKernel = NULL;
+static cl_kernel        clTransposeKernel = NULL; 
+static cl_kernel        clGeluKernel = NULL; 
+static int              gpu_ready = 0;
+
+// OpenCL Kernels (Float32) - Corrected & Formatted
+const char *clSource = 
+// 1. MatMul Kernel
+"__kernel void matmul(__global const float* A, __global const float* B, __global float* C, int M, int K, int N) {\n"
+"   int row = get_global_id(0);\n"
+"   int col = get_global_id(1);\n"
+"   if(row < M && col < N) {\n"
+"       float sum = 0.0f;\n"
+"       for(int k=0; k<K; k++) {\n"
+"           sum += A[row*K + k] * B[k*N + col];\n"
+"       }\n"
+"       C[row*N + col] = sum;\n"
+"   }\n"
+"}\n"
+
+// 2. Transpose Kernel
+"__kernel void transpose(__global const float* A, __global float* B, int Rows, int Cols) {\n"
+"   int r = get_global_id(0);\n"
+"   int c = get_global_id(1);\n"
+"   if(r < Rows && c < Cols) {\n"
+"       // Output(c, r) = Input(r, c)\n"
+"       B[c * Rows + r] = A[r * Cols + c];\n"
+"   }\n"
+"}\n"
+
+// 3. GELU Kernel
+"__kernel void gelu(__global float* A, int Size) {\n"
+"   int i = get_global_id(0);\n"
+"   if(i < Size) {\n"
+"       float x = A[i];\n"
+"       float cube = x * x * x;\n"
+"       float inner = 0.7978845608f * (x + 0.044715f * cube);\n"
+"       A[i] = 0.5f * x * (1.0f + tanh(inner));\n"
+"   }\n"
+"}\n";
+
+void init_opencl() {
+    //printf("\n[GPU] Attempting to initialize OpenCL...\n");
+
+    cl_platform_id platform_id = NULL;
+    cl_device_id device_id = NULL;
+    cl_uint ret_num_devices;
+    cl_uint ret_num_platforms;
+    cl_int ret;
+
+    // 1. Get Platform
+    ret = clGetPlatformIDs(1, &platform_id, &ret_num_platforms);
+    if (ret != CL_SUCCESS) {
+        printf("[GPU] Error: Could not get Platform ID. Error Code: %d\n", ret);
+        return;
+    }
+    //printf("[GPU] Platform Found.\n");
+
+    // 2. Get Device (Try GPU first)
+    ret = clGetDeviceIDs(platform_id, CL_DEVICE_TYPE_GPU, 1, &device_id, &ret_num_devices);
+    if (ret != CL_SUCCESS) {
+         printf("[GPU] Warning: No GPU Device found. Trying CPU...\n");
+         ret = clGetDeviceIDs(platform_id, CL_DEVICE_TYPE_CPU, 1, &device_id, &ret_num_devices);
+    }
+    
+    if (ret != CL_SUCCESS) {
+        printf("[GPU] Error: No OpenCL Device found at all. Error Code: %d\n", ret);
+        return; 
+    }
+
+    // Print Device Name
+    char devName[128];
+    clGetDeviceInfo(device_id, CL_DEVICE_NAME, 128, devName, NULL);
+    printf("[GPU] Device Found: %s\n", devName);
+
+    // 3. Create Context
+    clContext = clCreateContext(NULL, 1, &device_id, NULL, NULL, &ret);
+    if (ret != CL_SUCCESS) {
+        printf("[GPU] Error: Create Context Failed. Error Code: %d\n", ret);
+        return;
+    }
+
+    // 4. Create Queue
+    // OpenCL 2.0 deprecated clCreateCommandQueue, but we use it for compatibility.
+    // If it fails, try clCreateCommandQueueWithProperties (if available in header)
+    clQueue = clCreateCommandQueue(clContext, device_id, 0, &ret);
+    if (ret != CL_SUCCESS) {
+        printf("[GPU] Error: Create Command Queue Failed. Error Code: %d\n", ret);
+        return;
+    }
+
+    // 5. Build Kernel (The Critical Part)
+    cl_program program = clCreateProgramWithSource(clContext, 1, (const char **)&clSource, NULL, &ret);
+    ret = clBuildProgram(program, 1, &device_id, NULL, NULL, NULL);
+    
+    if (ret != CL_SUCCESS) {
+        printf("[GPU] Error: Kernel Compilation Failed! Error Code: %d\n", ret);
+        
+        // Get Build Log to see WHY
+        size_t len;
+        clGetProgramBuildInfo(program, device_id, CL_PROGRAM_BUILD_LOG, 0, NULL, &len);
+        char *buffer = (char *)malloc(len);
+        clGetProgramBuildInfo(program, device_id, CL_PROGRAM_BUILD_LOG, len, buffer, NULL);
+        printf("[GPU] Build Log:\n%s\n", buffer);
+        free(buffer);
+        
+        return;
+    }
+    
+    clMatMulKernel = clCreateKernel(program, "matmul", &ret);
+    if (ret != CL_SUCCESS) {
+        printf("[GPU] Error: Create Kernel Failed.\n");
+        return;
+    }
+
+    clTransposeKernel = clCreateKernel(program, "transpose", &ret);
+    if (ret != CL_SUCCESS) printf("[GPU] Error creating Transpose kernel\n");
+
+    clGeluKernel = clCreateKernel(program, "gelu", &ret);
+    if (ret != CL_SUCCESS) printf("[GPU] Error creating GELU kernel\n");
+
+    gpu_ready = 1;
+    printf("[RingTensor] GPU Acceleration Enabled.\n");
+}
+
+//GPU multiplication function (with Double <-> Float transformation)
+int gpu_matmul(tensor_t *A, tensor_t *B, tensor_t *C) {
+    if (!gpu_ready) return 0;
+
+    int M = A->rows;
+    int K = A->cols; 
+    int N = B->cols;
+    
+    size_t num_elements_A = (size_t)A->size;
+    size_t num_elements_B = (size_t)B->size;
+    size_t num_elements_C = (size_t)C->size;
+    
+    size_t szA_bytes = num_elements_A * sizeof(float);
+    size_t szB_bytes = num_elements_B * sizeof(float);
+    size_t szC_bytes = num_elements_C * sizeof(float);
+    
+    cl_int ret;
+    int i; 
+    int limit; 
+
+    // 1. Float array allocation
+    float *fA = (float *)malloc(szA_bytes);
+    float *fB = (float *)malloc(szB_bytes);
+    float *fC = (float *)malloc(szC_bytes);
+    
+    if (!fA || !fB || !fC) {
+        if(fA) free(fA); if(fB) free(fB); if(fC) free(fC);
+        return 0;
+    }
+
+    // 2. Double -> Float
+    // MSVC OpenMP requires signed integer loop variable
+    limit = (int)num_elements_A;
+    #pragma omp parallel for private(i)
+    for(i=0; i<limit; i++) fA[i] = (float)A->data[i];
+    
+    limit = (int)num_elements_B;
+    #pragma omp parallel for private(i)
+    for(i=0; i<limit; i++) fB[i] = (float)B->data[i];
+
+    // 3. OpenCL Buffers
+    cl_mem bufA = clCreateBuffer(clContext, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, szA_bytes, fA, &ret);
+    cl_mem bufB = clCreateBuffer(clContext, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, szB_bytes, fB, &ret);
+    cl_mem bufC = clCreateBuffer(clContext, CL_MEM_WRITE_ONLY, szC_bytes, NULL, &ret);
+
+    if (ret != CL_SUCCESS) { free(fA); free(fB); free(fC); return 0; }
+
+    // 4. Args
+    clSetKernelArg(clMatMulKernel, 0, sizeof(cl_mem), (void *)&bufA);
+    clSetKernelArg(clMatMulKernel, 1, sizeof(cl_mem), (void *)&bufB);
+    clSetKernelArg(clMatMulKernel, 2, sizeof(cl_mem), (void *)&bufC);
+    clSetKernelArg(clMatMulKernel, 3, sizeof(int), &M);
+    clSetKernelArg(clMatMulKernel, 4, sizeof(int), &K);
+    clSetKernelArg(clMatMulKernel, 5, sizeof(int), &N);
+
+    // 5. Execute
+    size_t global_item_size[2] = { (size_t)M, (size_t)N };
+    ret = clEnqueueNDRangeKernel(clQueue, clMatMulKernel, 2, NULL, global_item_size, NULL, 0, NULL, NULL);
+
+    // 6. Read
+    if (ret == CL_SUCCESS) {
+        ret = clEnqueueReadBuffer(clQueue, bufC, CL_TRUE, 0, szC_bytes, fC, 0, NULL, NULL);
+    }
+
+    // 7. التحويل (Float -> Double)
+    if (ret == CL_SUCCESS) {
+        limit = (int)num_elements_C;
+        #pragma omp parallel for private(i)
+        for(i=0; i<limit; i++) C->data[i] = (double)fC[i];
+    }
+
+    // 8. Cleanup
+    clReleaseMemObject(bufA); clReleaseMemObject(bufB); clReleaseMemObject(bufC);
+    free(fA); free(fB); free(fC);
+    
+    return (ret == CL_SUCCESS);
+}
+
+int gpu_transpose(tensor_t *A, tensor_t *C) {
+    if (!gpu_ready) return 0;
+    
+    int Rows = A->rows;
+    int Cols = A->cols;
+    size_t num_elements = (size_t)A->size;
+    size_t sz_bytes = num_elements * sizeof(float);
+    cl_int ret;
+    int i, limit; 
+
+    float *fA = (float *)malloc(sz_bytes);
+    if (!fA) return 0;
+    
+    limit = (int)num_elements;
+    #pragma omp parallel for private(i)
+    for(i=0; i<limit; i++) fA[i] = (float)A->data[i];
+
+    cl_mem bufA = clCreateBuffer(clContext, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sz_bytes, fA, &ret);
+    cl_mem bufC = clCreateBuffer(clContext, CL_MEM_WRITE_ONLY, sz_bytes, NULL, &ret);
+
+    if (ret != CL_SUCCESS) { free(fA); return 0; }
+
+    clSetKernelArg(clTransposeKernel, 0, sizeof(cl_mem), (void *)&bufA);
+    clSetKernelArg(clTransposeKernel, 1, sizeof(cl_mem), (void *)&bufC);
+    clSetKernelArg(clTransposeKernel, 2, sizeof(int), &Rows);
+    clSetKernelArg(clTransposeKernel, 3, sizeof(int), &Cols);
+
+    size_t global_item_size[2] = { (size_t)Rows, (size_t)Cols };
+    ret = clEnqueueNDRangeKernel(clQueue, clTransposeKernel, 2, NULL, global_item_size, NULL, 0, NULL, NULL);
+
+    float *fC = (float *)malloc(sz_bytes);
+    if (ret == CL_SUCCESS && fC) {
+        ret = clEnqueueReadBuffer(clQueue, bufC, CL_TRUE, 0, sz_bytes, fC, 0, NULL, NULL);
+        if (ret == CL_SUCCESS) {
+            limit = (int)num_elements;
+            #pragma omp parallel for private(i)
+            for(i=0; i<limit; i++) C->data[i] = (double)fC[i];
+        }
+    }
+
+    clReleaseMemObject(bufA); clReleaseMemObject(bufC);
+    free(fA); if (fC) free(fC);
+
+    return (ret == CL_SUCCESS);
+}
+
+int gpu_gelu(tensor_t *T) {
+    if (!gpu_ready) return 0;
+    
+    size_t num_elements = (size_t)T->size;
+    size_t sz_bytes = num_elements * sizeof(float);
+    cl_int ret;
+    int i, limit;
+
+    float *fT = (float *)malloc(sz_bytes);
+    if (!fT) return 0;
+    
+    limit = (int)num_elements;
+    #pragma omp parallel for private(i)
+    for(i=0; i<limit; i++) fT[i] = (float)T->data[i];
+
+    cl_mem bufT = clCreateBuffer(clContext, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, sz_bytes, fT, &ret);
+    if (ret != CL_SUCCESS) { free(fT); return 0; }
+
+    int Size = (int)num_elements;
+    clSetKernelArg(clGeluKernel, 0, sizeof(cl_mem), (void *)&bufT);
+    clSetKernelArg(clGeluKernel, 1, sizeof(int), &Size);
+    
+    size_t global_size = num_elements;
+    ret = clEnqueueNDRangeKernel(clQueue, clGeluKernel, 1, NULL, &global_size, NULL, 0, NULL, NULL);
+
+    if (ret == CL_SUCCESS) {
+        ret = clEnqueueReadBuffer(clQueue, bufT, CL_TRUE, 0, sz_bytes, fT, 0, NULL, NULL);
+        if (ret == CL_SUCCESS) {
+            limit = (int)num_elements;
+            #pragma omp parallel for private(i)
+            for(i=0; i<limit; i++) T->data[i] = (double)fT[i];
+        }
+    }
+
+    clReleaseMemObject(bufT);
+    free(fT);
+    return (ret == CL_SUCCESS);
+}
+
+#endif
+
 /* 
 ** Cache Block Size
 ** 32 doubles * 8 bytes = 256 bytes (Fits easily in L1 Cache) 
@@ -19,11 +322,59 @@
 */
 #define PARALLEL_THRESHOLD 50000
 
+/* ========================================================================== */
+/* GRAPH STATE                                                                */
+/* ========================================================================== */
+
+#define MAX_NODES 2048
+
+static GraphNode* GRAPH[MAX_NODES];
+static int GRAPH_SIZE = 0;
+static int GRAPH_OPTIMIZER = 0; // 0: SGD, 1: ADAM
+
+/* ========================================================================== */
+/* HELPER FUNCTIONS                                                           */
+/* ========================================================================== */
+
+/* Allocate memory for the Tensor if it doesn't already exist.*/
+static void ensure_tensor_memory(tensor_t **t, int rows, int cols) {
+    if (*t == NULL) {
+        *t = (tensor_t*)malloc(sizeof(tensor_t));
+        (*t)->rows = rows;
+        (*t)->cols = cols;
+        (*t)->size = rows * cols;
+        (*t)->ndim = 2;
+        (*t)->shape[0] = 1;
+        (*t)->shape[1] = 1;
+        (*t)->shape[2] = rows;
+        (*t)->shape[3] = cols;
+        (*t)->data = (double*)calloc(rows * cols, sizeof(double));
+        (*t)->is_owner = 1;
+    }
+}
+
+static void copy_tensor(tensor_t *src, tensor_t *dst) {
+    int i;
+    if (dst->size != src->size) return;
+    
+    #pragma omp parallel for if(src->size > 50000)
+    for(i=0; i<src->size; i++) {
+        dst->data[i] = src->data[i];
+    }
+}
+
+/*Gradient Accumulation
+static void accumulate_grad(GraphNode *node, tensor_t *grad_to_add) {
+    if (!node) return;
+    ensure_tensor_memory(&node->grad, grad_to_add->rows, grad_to_add->cols);
+    internal_add(node->grad, grad_to_add);
+}
+ */
 /* --- Memory Management --- */
 void ring_tensor_free(void *pState, void *pPointer) {
     tensor_t *t = (tensor_t *)pPointer;
     if (t != NULL) {
-        if (t->data != NULL) free(t->data);
+        if (t->is_owner && t->data != NULL) free(t->data);
         free(t);
     }
 }
@@ -71,8 +422,8 @@ RING_FUNC(ring_tensor_init) {
     // Legacy Aliases
     t->rows = rows;
     t->cols = cols;
-    
     t->size = rows * cols;
+    t->is_owner = 1;
     
     t->data = (double *)calloc(t->size, sizeof(double));
     if (!t->data) { free(t); RING_API_ERROR("Malloc Data Fail"); return; }
@@ -153,6 +504,7 @@ RING_FUNC(ring_tensor_copy) {
     Dest->size = Src->size;
     Dest->ndim = Src->ndim;
     
+    Dest->is_owner = 1;
     for(i=0; i<4; i++) Dest->shape[i] = Src->shape[i];
 
     // 3. Allocate Data
@@ -269,189 +621,308 @@ RING_FUNC(ring_tensor_get) {
 /* --- 2. ELEMENT-WISE MATH (OPTIMIZED) ------------------------------- */
 /* ==================================================================== */
 
-void tensor_op_elem(void *pPointer, int op) {
-    tensor_t *A = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
-    tensor_t *B = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
+/* Internal Kernels - Element-wise operations */
+void internal_add(tensor_t *A, tensor_t *B) {
     int i;
-    int size = A->size;
+    #pragma omp parallel for if(A->size > PARALLEL_THRESHOLD)
+    for(i=0; i<A->size; i++) A->data[i] += B->data[i];
+}
 
-    if (A->size != B->size) { RING_API_ERROR("Tensor Size Mismatch"); return; }
+void internal_sub(tensor_t *A, tensor_t *B) {
+    int i;
+    #pragma omp parallel for if(A->size > PARALLEL_THRESHOLD)
+    for(i=0; i<A->size; i++) A->data[i] -= B->data[i];
+}
 
-    #pragma omp parallel for if(size > PARALLEL_THRESHOLD)
-    for(i=0; i<size; i++) {
-        switch(op) {
-            case 1: A->data[i] += B->data[i]; break;
-            case 2: A->data[i] -= B->data[i]; break;
-            case 3: A->data[i] *= B->data[i]; break;
-            case 4: A->data[i] = (B->data[i] != 0) ? A->data[i] / B->data[i] : 0.0; break;
-        }
+void internal_mul_elem(tensor_t *A, tensor_t *B) {
+    int i;
+    #pragma omp parallel for if(A->size > PARALLEL_THRESHOLD)
+    for(i=0; i<A->size; i++) A->data[i] *= B->data[i];
+}
+
+void internal_div(tensor_t *A, tensor_t *B) {
+    int i;
+    #pragma omp parallel for if(A->size > PARALLEL_THRESHOLD)
+    for(i=0; i<A->size; i++) {
+        A->data[i] = (B->data[i] != 0) ? A->data[i] / B->data[i] : 0.0;
     }
 }
 
-RING_FUNC(ring_tensor_add)      { tensor_op_elem(pPointer, 1); }
-RING_FUNC(ring_tensor_sub)      { tensor_op_elem(pPointer, 2); }
-RING_FUNC(ring_tensor_mul_elem) { tensor_op_elem(pPointer, 3); }
-RING_FUNC(ring_tensor_div)      { tensor_op_elem(pPointer, 4); }
+void internal_scalar_mul(tensor_t *T, double scalar) {
+    int i;
+    #pragma omp parallel for if(T->size > PARALLEL_THRESHOLD)
+    for(i=0; i<T->size; i++) T->data[i] *= scalar;
+}
+
+void internal_add_scalar(tensor_t *T, double scalar) {
+    int i;
+    #pragma omp parallel for if(T->size > PARALLEL_THRESHOLD)
+    for(i=0; i<T->size; i++) T->data[i] += scalar;
+}
+
+void internal_sub_scalar(tensor_t *T, double scalar) {
+    int i;
+    #pragma omp parallel for if(T->size > PARALLEL_THRESHOLD)
+    for(i=0; i<T->size; i++) T->data[i] -= scalar;
+}
+
+/* Ring API Wrappers */
+RING_FUNC(ring_tensor_add) {
+    tensor_t *A = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    tensor_t *B = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
+    if (A->size != B->size) { RING_API_ERROR("Tensor Size Mismatch"); return; }
+    internal_add(A, B);
+}
+
+RING_FUNC(ring_tensor_sub) {
+    tensor_t *A = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    tensor_t *B = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
+    if (A->size != B->size) { RING_API_ERROR("Tensor Size Mismatch"); return; }
+    internal_sub(A, B);
+}
+
+RING_FUNC(ring_tensor_mul_elem) {
+    tensor_t *A = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    tensor_t *B = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
+    if (A->size != B->size) { RING_API_ERROR("Tensor Size Mismatch"); return; }
+    internal_mul_elem(A, B);
+}
+
+RING_FUNC(ring_tensor_div) {
+    tensor_t *A = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    tensor_t *B = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
+    if (A->size != B->size) { RING_API_ERROR("Tensor Size Mismatch"); return; }
+    internal_div(A, B);
+}
 
 RING_FUNC(ring_tensor_scalar_mul) {
-    tensor_t *A = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    tensor_t *T = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
     double v = RING_API_GETNUMBER(2);
-    int i; 
-    int size = A->size;
-    
-    #pragma omp parallel for if(size > PARALLEL_THRESHOLD)
-    for(i=0; i<size; i++) A->data[i] *= v;
+    internal_scalar_mul(T, v);
 }
 
 RING_FUNC(ring_tensor_add_scalar) {
-    tensor_t *A = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    tensor_t *T = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
     double v = RING_API_GETNUMBER(2);
-    int i; 
-    int size = A->size;
-    
-    #pragma omp parallel for if(size > PARALLEL_THRESHOLD)
-    for(i=0; i<size; i++) A->data[i] += v;
+    internal_add_scalar(T, v);
 }
 
 RING_FUNC(ring_tensor_sub_scalar) {
-    tensor_t *A = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    tensor_t *T = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
     double v = RING_API_GETNUMBER(2);
-    int i;
-    int size = A->size;
-    
-    #pragma omp parallel for if(size > PARALLEL_THRESHOLD)
-    for(i=0; i<size; i++) A->data[i] -= v;
+    internal_sub_scalar(T, v);
 }
 
 /* ==================================================================== */
 /* --- 3. TRANSFORMS & ACTIVATIONS ------------------------------------ */
 /* ==================================================================== */
 
-RING_FUNC(ring_tensor_fill) {
-    tensor_t *A = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
-    double v = RING_API_GETNUMBER(2);
+/* Internal Kernels */
+void internal_fill(tensor_t *T, double value) {
     int i;
-    int size = A->size;
-    
-    #pragma omp parallel for if(size > PARALLEL_THRESHOLD)
-    for(i=0; i<size; i++) A->data[i] = v;
+    #pragma omp parallel for if(T->size > PARALLEL_THRESHOLD)
+    for(i=0; i<T->size; i++) T->data[i] = value;
+}
+
+void internal_random(tensor_t *T, double min, double max) {
+    int i;
+    double range = max - min;
+    for(i=0; i<T->size; i++) {
+        T->data[i] = min + ((double)rand() / RAND_MAX) * range;
+    }
+}
+
+void internal_square(tensor_t *T) {
+    int i;
+    double v;
+    #pragma omp parallel for if(T->size > PARALLEL_THRESHOLD) private(v)
+    for(i=0; i<T->size; i++) {
+        v = T->data[i];
+        T->data[i] = v * v;
+    }
+}
+
+void internal_sqrt_tensor(tensor_t *T) {
+    int i;
+    #pragma omp parallel for if(T->size > PARALLEL_THRESHOLD)
+    for(i=0; i<T->size; i++) T->data[i] = sqrt(T->data[i]);
+}
+
+void internal_exp(tensor_t *T) {
+    int i;
+    #pragma omp parallel for if(T->size > PARALLEL_THRESHOLD)
+    for(i=0; i<T->size; i++) T->data[i] = exp(T->data[i]);
+}
+
+void internal_sigmoid(tensor_t *T) {
+    int i;
+    double v;
+    #pragma omp parallel for if(T->size > PARALLEL_THRESHOLD) private(v)
+    for(i=0; i<T->size; i++) {
+        v = T->data[i];
+        T->data[i] = 1.0 / (1.0 + exp(-v));
+    }
+}
+
+void internal_sigmoid_prime(tensor_t *T) {
+    int i;
+    double v;
+    #pragma omp parallel for if(T->size > PARALLEL_THRESHOLD) private(v)
+    for(i=0; i<T->size; i++) {
+        v = T->data[i];
+        T->data[i] = v * (1.0 - v);
+    }
+}
+
+void internal_tanh_activation(tensor_t *T) {
+    int i;
+    #pragma omp parallel for if(T->size > PARALLEL_THRESHOLD)
+    for(i=0; i<T->size; i++) T->data[i] = tanh(T->data[i]);
+}
+
+void internal_tanh_prime(tensor_t *T) {
+    int i;
+    double v;
+    #pragma omp parallel for if(T->size > PARALLEL_THRESHOLD) private(v)
+    for(i=0; i<T->size; i++) {
+        v = T->data[i];
+        T->data[i] = 1.0 - (v * v);
+    }
+}
+
+void internal_relu(tensor_t *T) {
+    int i;
+    double v;
+    #pragma omp parallel for if(T->size > PARALLEL_THRESHOLD) private(v)
+    for(i=0; i<T->size; i++) {
+        v = T->data[i];
+        T->data[i] = (v > 0) ? v : 0;
+    }
+}
+
+void internal_relu_prime(tensor_t *T) {
+    int i;
+    double v;
+    #pragma omp parallel for if(T->size > PARALLEL_THRESHOLD) private(v)
+    for(i=0; i<T->size; i++) {
+        v = T->data[i];
+        T->data[i] = (v > 0) ? 1.0 : 0.0;
+    }
+}
+
+/* Ring API Wrappers */
+RING_FUNC(ring_tensor_fill) {
+    tensor_t *T = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    double v = RING_API_GETNUMBER(2);
+    internal_fill(T, v);
 }
 
 RING_FUNC(ring_tensor_random) {
-    tensor_t *A = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
-    int i;
-    // Keep Random Serial for Reproducibility
-    for(i=0; i<A->size; i++) A->data[i] = (double)rand() / (double)RAND_MAX;
+    tensor_t *T = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    internal_random(T, 0.0, 1.0);
 }
 
-void tensor_act(void *pPointer, int op) {
-    tensor_t *A = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
-    int i;
-    int size = A->size;
-    double v;
+RING_FUNC(ring_tensor_square)        { internal_square((tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR)); }
+RING_FUNC(ring_tensor_sqrt)          { internal_sqrt_tensor((tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR)); }
+RING_FUNC(ring_tensor_exp)           { internal_exp((tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR)); }
+RING_FUNC(ring_tensor_sigmoid)       { internal_sigmoid((tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR)); }
+RING_FUNC(ring_tensor_sigmoid_prime) { internal_sigmoid_prime((tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR)); }
+RING_FUNC(ring_tensor_tanh)          { internal_tanh_activation((tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR)); }
+RING_FUNC(ring_tensor_tanh_prime)    { internal_tanh_prime((tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR)); }
+RING_FUNC(ring_tensor_relu)          { internal_relu((tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR)); }
+RING_FUNC(ring_tensor_relu_prime)    { internal_relu_prime((tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR)); }
+
+void internal_softmax_backward(tensor_t *Y, tensor_t *dY, tensor_t *dX) {
+    int r, c, rows = Y->rows, cols = Y->cols;
     
-    #pragma omp parallel for if(size > PARALLEL_THRESHOLD) private(v)
-    for(i=0; i<size; i++) {
-        v = A->data[i];
-        switch(op) {
-            case 1: A->data[i] = v * v; break; // Square
-            case 2: A->data[i] = sqrt(v); break; // Sqrt
-            case 3: A->data[i] = exp(v); break; // Exp
-            case 4: A->data[i] = 1.0 / (1.0 + exp(-v)); break; // Sigmoid
-            case 5: A->data[i] = v * (1.0 - v); break; // SigmoidPrime
-            case 6: A->data[i] = tanh(v); break; // Tanh
-            case 7: A->data[i] = 1.0 - (v * v); break; // TanhPrime
-            case 8: A->data[i] = (v > 0) ? v : 0; break; // ReLU
-            case 9: A->data[i] = (v > 0) ? 1.0 : 0.0; break; // ReLUPrime
+    #pragma omp parallel for if(rows > 32) private(c)
+    for(r = 0; r < rows; r++) {
+        double sum_dy_y = 0.0;
+        int offset = r * cols;
+        for(c = 0; c < cols; c++) sum_dy_y += dY->data[offset + c] * Y->data[offset + c];
+        for(c = 0; c < cols; c++) {
+            dX->data[offset + c] = Y->data[offset + c] * (dY->data[offset + c] - sum_dy_y);
         }
     }
 }
 
-RING_FUNC(ring_tensor_square)        { tensor_act(pPointer, 1); }
-RING_FUNC(ring_tensor_sqrt)          { tensor_act(pPointer, 2); }
-RING_FUNC(ring_tensor_exp)           { tensor_act(pPointer, 3); }
-RING_FUNC(ring_tensor_sigmoid)       { tensor_act(pPointer, 4); }
-RING_FUNC(ring_tensor_sigmoid_prime) { tensor_act(pPointer, 5); }
-RING_FUNC(ring_tensor_tanh)          { tensor_act(pPointer, 6); }
-RING_FUNC(ring_tensor_tanh_prime)    { tensor_act(pPointer, 7); }
-RING_FUNC(ring_tensor_relu)          { tensor_act(pPointer, 8); }
-RING_FUNC(ring_tensor_relu_prime)    { tensor_act(pPointer, 9); }
-
-RING_FUNC(ring_tensor_softmax) {
-    tensor_t *T = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+void internal_softmax(tensor_t *T) {
     int r, c;
     
-    // Row-wise Softmax
     #pragma omp parallel for if(T->rows > 64) private(c)
     for(r=0; r<T->rows; r++) {
         double maxVal = -DBL_MAX;
-        double sum = 0.0;
         int offset = r * T->cols;
-        double invSum;
         
-        for(c=0; c<T->cols; c++) if(T->data[offset+c] > maxVal) maxVal = T->data[offset+c];
+        // Find Max
+        for(c=0; c<T->cols; c++) {
+            if(T->data[offset+c] > maxVal) maxVal = T->data[offset+c];
+        }
         
+        // Safety: If maxVal is still very small (masked row), force zero output
+        if (maxVal < -1e8) {
+             for(c=0; c<T->cols; c++) T->data[offset+c] = 0.0;
+             continue;
+        }
+
+        double sum = 0.0;
         for(c=0; c<T->cols; c++) {
             T->data[offset+c] = exp(T->data[offset+c] - maxVal);
             sum += T->data[offset+c];
         }
         
-        invSum = (sum != 0) ? 1.0/sum : 0.0;
+        double invSum = (sum > 1e-9) ? (1.0/sum) : 0.0;
         for(c=0; c<T->cols; c++) T->data[offset+c] *= invSum;
     }
+}
+
+RING_FUNC(ring_tensor_softmax) {
+    tensor_t *T = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    internal_softmax(T);
 }
 
 /* ==================================================================== */
 /* --- 4. MATRIX OPS (OPTIMIZED MATMUL) ------------------------------- */
 /* ==================================================================== */
 
-RING_FUNC(ring_tensor_matmul) {
-    tensor_t *A = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
-    tensor_t *B = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
-    tensor_t *C = (tensor_t *)RING_API_GETCPOINTER(3, RING_VM_POINTER_TENSOR);
-    
+/* Internal Kernel - MatMul */
+void internal_matmul(tensor_t *A, tensor_t *B, tensor_t *C) {
+
     int rA = A->rows; int cA = A->cols; int cB = B->cols;
-    
-    // تعريف المتغيرات في البداية (MSVC C89 Compliance)
     int i, j, k, ii, jj, kk;
     int i_max, j_max, k_max;
     double *rowC, *rowA;
 
-    if (cA != B->rows) { RING_API_ERROR("MatMul Dims Mismatch"); return; }
-    
-    // تحسين 1: استخدام memset لتصفير المصفوفة (أسرع من حلقة for)
-    memset(C->data, 0, (size_t)rA * cB * sizeof(double));
+    // --- SMART SWITCH ---
+    long operations = (long)rA * cA * cB;
 
-    // --- TILED ALGORITHM (Cache Friendly) ---
-    // نوزع الكتل (Blocks) على الأنوية
-    // private(...) ضرورية جداً هنا لمنع تداخل الخيوط
+     #ifdef USE_OPENCL
+    // Raising the threshold to 5 million operations to ensure that the benefit of the GPU covers the cost of transfer
+    // (For powerful cards, it can be reduced, but for the HD 5500 this number is safe)
+    if (gpu_ready && operations > 1000000) {
+        if (gpu_matmul(A, B, C)) {
+            return; // Done by GPU
+        }
+    }
+    #endif
+    // --------------------
+
+    memset(C->data, 0, (size_t)rA * cB * sizeof(double));
     
     #pragma omp parallel for schedule(static) private(ii, jj, kk, i, j, k, i_max, j_max, k_max, rowC, rowA)
     for (ii = 0; ii < rA; ii += TILE_SIZE) {
-        
         i_max = (ii + TILE_SIZE > rA) ? rA : ii + TILE_SIZE;
-
         for (kk = 0; kk < cA; kk += TILE_SIZE) {
             k_max = (kk + TILE_SIZE > cA) ? cA : kk + TILE_SIZE;
-
             for (jj = 0; jj < cB; jj += TILE_SIZE) {
                 j_max = (jj + TILE_SIZE > cB) ? cB : jj + TILE_SIZE;
-
-                // Inner loops: الضرب الفعلي داخل البلاطة (Tile)
-                // هذه الحلقات صغيرة وتناسب الكاش
                 for (i = ii; i < i_max; i++) {
                     rowC = &C->data[i * cB];
                     rowA = &A->data[i * cA];
-                    
                     for (k = kk; k < k_max; k++) {
                         double valA = rowA[k];
-                        
-                        // Sparse Optimization: تخطي الأصفار
                         if (valA == 0.0) continue;
-
                         double *rowB = &B->data[k * cB];
-                        
-                        // Vectorized loop (Compiler will use SIMD/AVX here)
                         for (j = jj; j < j_max; j++) {
                             rowC[j] += valA * rowB[j];
                         }
@@ -462,41 +933,75 @@ RING_FUNC(ring_tensor_matmul) {
     }
 }
 
+RING_FUNC(ring_tensor_matmul) {
+    tensor_t *A = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    tensor_t *B = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
+    tensor_t *C = (tensor_t *)RING_API_GETCPOINTER(3, RING_VM_POINTER_TENSOR);
+    if (A->cols != B->rows) { RING_API_ERROR("MatMul Dims Mismatch"); return; }
+    internal_matmul(A, B, C);
+}
+
 RING_FUNC(ring_tensor_transpose) {
     tensor_t *A = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
     tensor_t *C = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
-    
+    if (A->rows != C->cols || A->cols != C->rows) { RING_API_ERROR("Transpose Dims Mismatch"); return; }
+    internal_transpose(A, C);
+}
+
+/* Internal Kernel - Transpose */
+void internal_transpose(tensor_t *A, tensor_t *R) {
+
     int rA = A->rows; 
     int cA = A->cols;
-    
-    // تعريف المتغيرات في البداية (توافق MSVC)
     int i, j, ii, jj;
     int i_max, j_max;
-    
-    // --- TILED TRANSPOSE ALGORITHM ---
-    // نقوم بتوزيع كتل الصفوف (Rows Blocks) على الأنوية
-    
+
+    #ifdef USE_OPENCL
+    // Rotation requires significant memory movement; the GPU is excellent here.
+    if (gpu_ready && A->size > 1000000) { //Threshold of 5 million elements
+        if (gpu_transpose(A, R)) return;
+    }
+    #endif
+
     #pragma omp parallel for schedule(static) private(ii, jj, i, j, i_max, j_max)
     for (ii = 0; ii < rA; ii += TILE_SIZE) {
-        
         i_max = (ii + TILE_SIZE > rA) ? rA : ii + TILE_SIZE;
-        
         for (jj = 0; jj < cA; jj += TILE_SIZE) {
-            
             j_max = (jj + TILE_SIZE > cA) ? cA : jj + TILE_SIZE;
-            
-            // --- OPTIMIZATION: Loop Order Swapped ---
-            // جعلنا الحلقة الخارجية j والداخلية i
-            // الهدف: الكتابة في C تكون متسلسلة (Sequential Write)
-            // C[... + i] أفضل بكثير من C[... + j*stride]
-            
             for (j = jj; j < j_max; j++) {
                 for (i = ii; i < i_max; i++) {
-                    // C[j][i] = A[i][j]
-                    // الآن C يُكتب فيه بشكل متتابع، و A يُقرأ منه بقفزات
-                    // القراءة العشوائية أهون على المعالج من الكتابة العشوائية
-                    C->data[j * rA + i] = A->data[i * cA + j];
+                    R->data[j * rA + i] = A->data[i * cA + j];
                 }
+            }
+        }
+    }
+}
+
+/* Internal Kernel - Sum */
+void internal_sum(tensor_t *T, int axis, tensor_t *R) {
+    int r, c;
+    double s;
+    double *ptr, *src, *dst, *rowPtr;
+    
+    memset(R->data, 0, R->size * sizeof(double));
+    
+    if (axis == 1) {
+        #pragma omp parallel for if(T->rows > 64) private(c, s, ptr)
+        for(r=0; r<T->rows; r++) {
+            s = 0;
+            ptr = &T->data[r * T->cols];
+            for(c=0; c<T->cols; c++) {
+                s += ptr[c];
+            }
+            R->data[r] = s;
+        }
+    } else {
+        src = T->data;
+        dst = R->data;
+        for(r=0; r<T->rows; r++) {
+            rowPtr = &src[r * T->cols];
+            for(c=0; c<T->cols; c++) {
+                dst[c] += rowPtr[c];
             }
         }
     }
@@ -506,45 +1011,20 @@ RING_FUNC(ring_tensor_sum) {
     tensor_t *T = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
     int axis = (int)RING_API_GETNUMBER(2);
     tensor_t *R = (tensor_t *)RING_API_GETCPOINTER(3, RING_VM_POINTER_TENSOR);
+    internal_sum(T, axis, R);
+}
+
+/* Internal Kernel - Add Row Vector */
+void internal_add_row_vec(tensor_t *A, tensor_t *B) {
+    int i, j;
+    double *rowA, *rowB;
     
-    // تعريف المتغيرات في البداية (توافق C89/MSVC)
-    int r, c;
-    double s;
-    double *ptr, *src, *dst, *rowPtr;
-
-    // تصفير النتيجة
-    memset(R->data, 0, R->size * sizeof(double));
-
-    if (axis == 1) { // Sum Rows (Collapse Cols) -> Result is Col Vector
-        
-        // المتغيرات s, c, ptr يجب أن تكون private لكل خيط
-        #pragma omp parallel for if(T->rows > 64) private(c, s, ptr)
-        for(r=0; r<T->rows; r++) {
-            s = 0;
-            ptr = &T->data[r * T->cols];
-            
-            for(c=0; c<T->cols; c++) {
-                s += ptr[c];
-            }
-            R->data[r] = s;
-        }
-
-    } else { // Sum Cols (Collapse Rows) -> Result is Row Vector (Bias Gradient)
-        
-        /* 
-        ** نبقيها تسلسلية (Serial) للأمان.
-        ** توازي هذا الجزء يتطلب Atomic Operations أو Reduction Array
-        ** وهو مكلف أكثر من الفائدة في أحجام الباتش الصغيرة/المتوسطة.
-        */
-        src = T->data;
-        dst = R->data;
-
-        for(r=0; r<T->rows; r++) {
-            rowPtr = &src[r * T->cols];
-            
-            for(c=0; c<T->cols; c++) {
-                dst[c] += rowPtr[c];
-            }
+    #pragma omp parallel for if(A->rows > 32) private(j, rowA, rowB)
+    for(i=0; i<A->rows; i++) {
+        rowA = &A->data[i * A->cols];
+        rowB = B->data;
+        for(j=0; j<A->cols; j++) {
+            rowA[j] += rowB[j];
         }
     }
 }
@@ -552,56 +1032,44 @@ RING_FUNC(ring_tensor_sum) {
 RING_FUNC(ring_tensor_add_row_vec) {
     tensor_t *A = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
     tensor_t *B = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
-    
-    // تعريف المتغيرات في البداية (توافق C89/ANSI C)
-    int i, j;
-    double *rowA, *rowB;
-    
     if (A->cols != B->cols) { RING_API_ERROR("Dim Mismatch"); return; }
+    internal_add_row_vec(A, B);
+}
 
-    // 1. تحديد المتغيرات الخاصة بكل خيط (Thread) لضمان عدم تداخل الذاكرة
-    // rowA, rowB, j يجب أن تكون خاصة لكل عملية
-    #pragma omp parallel for if(A->rows > 32) private(j, rowA, rowB)
-    for(i=0; i<A->rows; i++) {
-        
-        // حساب المؤشرات
-        rowA = &A->data[i * A->cols];
-        rowB = B->data; // هذا ثابت، لكن تعيينه هنا آمن وسريع
-        
-        // الحلقة الداخلية (Vectorized)
-        for(j=0; j<A->cols; j++) {
-            rowA[j] += rowB[j];
-        }
-    }
+/* Internal Kernel - Mean */
+void internal_mean(tensor_t *T, int axis, tensor_t *R) {
+    internal_sum(T, axis, R);
+    int divisor = (axis == 1) ? T->cols : T->rows;
+    internal_scalar_mul(R, 1.0 / divisor);
 }
 
 RING_FUNC(ring_tensor_mean) {
     tensor_t *T = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
-    double sum = 0;
-    int i;
-    #pragma omp parallel for reduction(+:sum) if(T->size > PARALLEL_THRESHOLD)
-    for(i=0; i<T->size; i++) sum += T->data[i];
-    RING_API_RETNUMBER(sum / T->size);
+    RING_API_RETNUMBER(internal_mean_global(T));
 }
+
+/* Internal Kernel - Argmax */
+int internal_argmax(tensor_t *T) {
+    int i;
+    int max_idx = 0;
+    double max_val = T->data[0];
+    for(i=1; i<T->size; i++) {
+        if (T->data[i] > max_val) {
+            max_val = T->data[i];
+            max_idx = i;
+        }
+    }
+    return max_idx;
+}
+    
+
+
+
 
 RING_FUNC(ring_tensor_argmax) {
     tensor_t *T = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
     tensor_t *R = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
-    int r, c;
-    
-    #pragma omp parallel for if(T->rows > 64) private(c)
-    for(r=0; r<T->rows; r++) {
-        double maxVal = -DBL_MAX;
-        int maxIdx = 1;
-        int offset = r * T->cols;
-        for(c=0; c<T->cols; c++) {
-            if(T->data[offset+c] > maxVal) {
-                maxVal = T->data[offset+c];
-                maxIdx = c + 1;
-            }
-        }
-        R->data[r] = (double)maxIdx;
-    }
+    internal_argmax_rowwise(T, R);
 }
 
 /*
@@ -620,36 +1088,19 @@ RING_FUNC(ring_tensor_slice_rows) {
 
     Src = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
     Dest = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
-    start_row = (int)RING_API_GETNUMBER(3); // 1-based index
-    count = (int)RING_API_GETNUMBER(4);     // Number of rows
+    start_row = (int)RING_API_GETNUMBER(3);
+    count = (int)RING_API_GETNUMBER(4);
 
-    // 1. Validation
     if (start_row < 1 || start_row + count - 1 > Src->rows) {
         RING_API_ERROR("Slice Rows: Index out of bounds");
         return;
     }
-    if (Dest->cols != Src->cols) {
-        RING_API_ERROR("Slice Rows: Column count mismatch");
-        return;
-    }
-    if (Dest->rows != count) {
-        RING_API_ERROR("Slice Rows: Destination rows must match count");
+    if (Dest->cols != Src->cols || Dest->rows != count) {
+        RING_API_ERROR("Slice Rows: Destination Dims Mismatch");
         return;
     }
 
-    // 2. Calculation (The Fast Part)
-    // Calculate where to start reading in Source (0-based index)
-    // Offset = (StartRow - 1) * NumberOfColumns
-    int src_offset_idx = (start_row - 1) * Src->cols;
-    
-    // Calculate total bytes to copy
-    // Bytes = NumberOfRowsToCopy * NumberOfColumns * SizeOfDouble
-    size_t total_elements = (size_t)count * Src->cols;
-    size_t bytes = total_elements * sizeof(double);
-    
-    // 3. Execution (Single Memcpy)
-    // Copy directly from Src memory address to Dest memory address
-    memcpy(Dest->data, &Src->data[src_offset_idx], bytes);
+    internal_slice_rows(Src, Dest, start_row, count);
 }
 
 /*
@@ -667,11 +1118,10 @@ RING_FUNC(ring_tensor_insert_rows) {
 
     Dest = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
     Src = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
-    start_row = (int)RING_API_GETNUMBER(3); // 1-based index
+    start_row = (int)RING_API_GETNUMBER(3);
 
-    // Validation
     if (start_row < 1 || start_row + Src->rows - 1 > Dest->rows) {
-        RING_API_ERROR("Insert Rows: Index out of bounds or Src too big");
+        RING_API_ERROR("Insert Rows: Index out of bounds");
         return;
     }
     if (Dest->cols != Src->cols) {
@@ -679,13 +1129,7 @@ RING_FUNC(ring_tensor_insert_rows) {
         return;
     }
 
-    // Math
-    size_t offset_elems = (size_t)(start_row - 1) * Dest->cols;
-    size_t copy_elems   = (size_t)Src->rows * Src->cols;
-    size_t copy_bytes   = copy_elems * sizeof(double);
-
-    // Blazing fast copy
-    memcpy(&Dest->data[offset_elems], Src->data, copy_bytes);
+    internal_insert_rows(Dest, Src, start_row);
 }
 
 /* ==================================================================== */
@@ -696,50 +1140,28 @@ RING_FUNC(ring_tensor_embedding_forward) {
     tensor_t *Ind = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
     tensor_t *W   = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
     tensor_t *Out = (tensor_t *)RING_API_GETCPOINTER(3, RING_VM_POINTER_TENSOR);
+    internal_embedding_forward(W, Ind, Out);
+}
+
+RING_FUNC(ring_tensor_copy_data) {
+    // Usage: copy_data(Dest, Src)
+    tensor_t *Dest = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    tensor_t *Src  = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
     
-    int total = Ind->size;
-    int dim = W->cols;
-    int vocab = W->rows;
-    int i;
-    
-    #pragma omp parallel for if(total > 32)
-    for(i=0; i<total; i++) {
-        int idx = (int)Ind->data[i];
-        
-        // تحويل من Ring indexing (1-based) إلى C indexing (0-based)
-        idx = idx - 1;
-        
-        // Bounds checking
-        if (idx < 0) idx = 0; 
-        if (idx >= vocab) idx = vocab - 1;
-        
-        memcpy(&Out->data[i * dim], &W->data[idx * dim], dim * sizeof(double));
+    if (Dest->size != Src->size) {
+        printf("ERROR: Copy Size Mismatch! Dest=%d, Src=%d\n", Dest->size, Src->size);
+        RING_API_ERROR("Size Mismatch");
+        return;
     }
+
+    memcpy(Dest->data, Src->data, Dest->size * sizeof(double));
 }
 
 RING_FUNC(ring_tensor_embedding_backward) {
-    tensor_t *Ind = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
-    tensor_t *GOut = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
+    tensor_t *GOut = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    tensor_t *Ind = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
     tensor_t *GW = (tensor_t *)RING_API_GETCPOINTER(3, RING_VM_POINTER_TENSOR);
-    
-    int total = Ind->size;
-    int dim = GW->cols;
-    int i, j;
-    
-    for(i=0; i<total; i++) {
-        int idx = (int)Ind->data[i];
-        
-        // ✅ تحويل من Ring indexing (1-based) إلى C indexing (0-based)
-        idx = idx - 1;
-        
-        // Bounds checking
-        if (idx < 0 || idx >= GW->rows) continue;
-        
-        double *g_src = &GOut->data[i * dim];
-        double *g_dst = &GW->data[idx * dim];
-        
-        for(j=0; j<dim; j++) g_dst[j] += g_src[j];
-    }
+    internal_embedding_backward(GOut, Ind, GW);
 }
 
 RING_FUNC(ring_tensor_layernorm) {
@@ -748,26 +1170,9 @@ RING_FUNC(ring_tensor_layernorm) {
     tensor_t *B = (tensor_t *)RING_API_GETCPOINTER(3, RING_VM_POINTER_TENSOR);
     tensor_t *Y = (tensor_t *)RING_API_GETCPOINTER(4, RING_VM_POINTER_TENSOR);
     double eps = RING_API_GETNUMBER(5);
-    int r, c, rows = X->rows, cols = X->cols;
     
-    #pragma omp parallel for if(rows > 32) private(c)
-    for(r=0; r<rows; r++) {
-        double mean = 0, var = 0;
-        double *px = &X->data[r*cols];
-        double *py = &Y->data[r*cols];
-        double invStd;
-        
-        for(c=0; c<cols; c++) mean += px[c];
-        mean /= cols;
-        
-        for(c=0; c<cols; c++) var += (px[c]-mean)*(px[c]-mean);
-        var /= cols;
-        
-        invStd = 1.0 / sqrt(var + eps);
-        for(c=0; c<cols; c++) {
-            py[c] = ((px[c] - mean) * invStd * G->data[c]) + B->data[c];
-        }
-    }
+    copy_tensor(X, Y);
+    internal_layernorm(Y, G, B, eps);
 }
 
 RING_FUNC(ring_tensor_attention_fast) {
@@ -776,55 +1181,7 @@ RING_FUNC(ring_tensor_attention_fast) {
     tensor_t *V = (tensor_t *)RING_API_GETCPOINTER(3, RING_VM_POINTER_TENSOR);
     tensor_t *Out = (tensor_t *)RING_API_GETCPOINTER(4, RING_VM_POINTER_TENSOR);
     double scale = RING_API_GETNUMBER(5);
-    
-    int seq = Q->rows;
-    int dim = Q->cols;
-    int i, j, k;
-    
-    // Allocating temp memory inside parallel region is expensive.
-    // Optimization: Do parallel loop but handle malloc carefully or use small stack buffer if dim is small.
-    // For large sequence, use malloc.
-    
-    #pragma omp parallel private(i, j, k)
-    {
-        double *scores = (double *)malloc(seq * sizeof(double));
-        if(scores) {
-            #pragma omp for
-            for(i=0; i<seq; i++) {
-                double *q_row = &Q->data[i*dim];
-                double *out_row = &Out->data[i*dim];
-                double maxVal = -DBL_MAX;
-                double sum = 0;
-                double invSum;
-                
-                // QK^T
-                for(j=0; j<seq; j++) {
-                    double *k_row = &K->data[j*dim];
-                    double dot = 0;
-                    for(k=0; k<dim; k++) dot += q_row[k] * k_row[k];
-                    scores[j] = dot * scale;
-                }
-                
-                // Softmax
-                for(j=0; j<seq; j++) if(scores[j] > maxVal) maxVal = scores[j];
-                for(j=0; j<seq; j++) {
-                    scores[j] = exp(scores[j] - maxVal);
-                    sum += scores[j];
-                }
-                invSum = 1.0/sum;
-                for(j=0; j<seq; j++) scores[j] *= invSum;
-                
-                // Score * V
-                memset(out_row, 0, dim * sizeof(double));
-                for(j=0; j<seq; j++) {
-                    double s = scores[j];
-                    double *v_row = &V->data[j*dim];
-                    for(k=0; k<dim; k++) out_row[k] += s * v_row[k];
-                }
-            }
-            free(scores);
-        }
-    }
+    internal_attention_forward(Q, K, V, Out, scale);
 }
 
 RING_FUNC(ring_tensor_attention_causal) {
@@ -833,54 +1190,7 @@ RING_FUNC(ring_tensor_attention_causal) {
     tensor_t *V = (tensor_t *)RING_API_GETCPOINTER(3, RING_VM_POINTER_TENSOR);
     tensor_t *Out = (tensor_t *)RING_API_GETCPOINTER(4, RING_VM_POINTER_TENSOR);
     double scale = RING_API_GETNUMBER(5);
-    
-    int seq = Q->rows;
-    int dim = Q->cols;
-    int i, j, k;
-    
-    #pragma omp parallel private(i, j, k)
-    {
-        double *scores = (double *)malloc(seq * sizeof(double));
-        if(scores) {
-            #pragma omp for
-            for(i=0; i<seq; i++) {
-                double *q_row = &Q->data[i*dim];
-                double *out_row = &Out->data[i*dim];
-                double maxVal = -1e9;
-                double sum = 0;
-                double invSum;
-                
-                // Masked QK^T
-                for(j=0; j<seq; j++) {
-                    if (j > i) { scores[j] = -1e9; continue; }
-                    
-                    double *k_row = &K->data[j*dim];
-                    double dot = 0;
-                    for(k=0; k<dim; k++) dot += q_row[k] * k_row[k];
-                    scores[j] = dot * scale;
-                }
-                
-                // Softmax
-                for(j=0; j<seq; j++) if(scores[j] > maxVal) maxVal = scores[j];
-                for(j=0; j<seq; j++) {
-                    scores[j] = exp(scores[j] - maxVal);
-                    sum += scores[j];
-                }
-                invSum = 1.0/sum;
-                for(j=0; j<seq; j++) scores[j] *= invSum;
-                
-                // Score * V
-                memset(out_row, 0, dim * sizeof(double));
-                for(j=0; j<seq; j++) {
-                    double s = scores[j];
-                    if(s < 1e-9) continue;
-                    double *v_row = &V->data[j*dim];
-                    for(k=0; k<dim; k++) out_row[k] += s * v_row[k];
-                }
-            }
-            free(scores);
-        }
-    }
+    internal_attention_causal(Q, K, V, Out, scale);
 }
 
 RING_FUNC(ring_tensor_select_columns) {
@@ -1039,7 +1349,7 @@ RING_FUNC(ring_tensor_update_adam) {
     for(i=0; i<size; i++) {
         double g = G->data[i];
         
-        // تحديث momentum
+        // Update momentum
         M->data[i] = (b1 * M->data[i]) + ((1.0 - b1) * g);
         V->data[i] = (b2 * V->data[i]) + ((1.0 - b2) * g * g);
         
@@ -1047,10 +1357,10 @@ RING_FUNC(ring_tensor_update_adam) {
         double v_hat = V->data[i] / corr2;
         if(v_hat < 0) v_hat = 0;
         
-        // تحديث الأوزان مع Adam
+        // Update Adam
         W->data[i] -= (lr * m_hat) / (sqrt(v_hat) + eps);
         
-        // تطبيق Weight Decay مباشرة (AdamW)
+        // Apply Weight Decay directly (AdamW)
         W->data[i] -= lr * weight_decay * W->data[i];
     }
 }
@@ -1069,13 +1379,7 @@ RING_FUNC(ring_tensor_update_sgd) {
 RING_FUNC(ring_tensor_dropout) {
     tensor_t *T = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
     double rate = RING_API_GETNUMBER(2);
-    double scale = 1.0 / (1.0 - rate);
-    int i;
-    // Serial
-    for(i=0; i<T->size; i++) {
-        if ((double)rand() / RAND_MAX < rate) T->data[i] = 0.0;
-        else T->data[i] *= scale;
-    }
+    internal_dropout(T, rate, 1);
 }
 
 /* ==================================================================== */
@@ -1732,6 +2036,13 @@ RING_FUNC(ring_tensor_clip_global_norm) {
 */
 RING_FUNC(ring_tensor_gelu) {
     tensor_t *T = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+
+    #ifdef USE_OPENCL
+    if (gpu_ready && T->size > 1000000) {
+        if (gpu_gelu(T)) return;
+    }
+    #endif
+
     int i;
     int size = T->size;
     double x, cube, inner;
@@ -1787,23 +2098,9 @@ RING_FUNC(ring_tensor_gelu_prime) {
 */
 RING_FUNC(ring_tensor_sum_squares) {
     tensor_t *T;
-    double sum = 0.0;
-    int i;
-
-    if (RING_API_PARACOUNT != 1) {
-        RING_API_ERROR(RING_API_MISS1PARA);
-        return;
-    }
-
+    if (RING_API_PARACOUNT != 1) { RING_API_ERROR(RING_API_MISS1PARA); return; }
     T = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
-    
-    // OpenMP Reduction for Speed
-    #pragma omp parallel for reduction(+:sum) if(T->size > 2000)
-    for(i = 0; i < T->size; i++) {
-        sum += (T->data[i] * T->data[i]);
-    }
-    
-    RING_API_RETNUMBER(sum);
+    RING_API_RETNUMBER(internal_sum_squares(T));
 }
 
 /*
@@ -1813,24 +2110,10 @@ RING_FUNC(ring_tensor_sum_squares) {
 RING_FUNC(ring_tensor_clip_tensor) {
     tensor_t *T;
     double max_val;
-    int i;
-    
-    if (RING_API_PARACOUNT != 2) {
-        RING_API_ERROR(RING_API_MISS2PARA);
-        return;
-    }
-    
+    if (RING_API_PARACOUNT != 2) { RING_API_ERROR(RING_API_MISS2PARA); return; }
     T = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
     max_val = RING_API_GETNUMBER(2);
-    
-    #pragma omp parallel for if(T->size > 1000)
-    for(i = 0; i < T->size; i++) {
-        if (T->data[i] > max_val) {
-            T->data[i] = max_val;
-        } else if (T->data[i] < -max_val) {
-            T->data[i] = -max_val;
-        }
-    }
+    internal_clip_tensor(T, -max_val, max_val);
 }
 
 /*
@@ -1921,11 +2204,18 @@ RING_FUNC(ring_tensor_mha_backward_fast) {
 ** Used for Positional Embeddings Broadcasting.
 ** Optimization: Uses Block Memcpy.
 */
+void internal_repeat_rows(tensor_t *Src, tensor_t *Dest, int nTimes) {
+    size_t chunk_bytes = Src->size * sizeof(double);
+    int i;
+    #pragma omp parallel for if(nTimes > 4)
+    for (i = 0; i < nTimes; i++) {
+        memcpy(&Dest->data[i * Src->size], Src->data, chunk_bytes);
+    }
+}
+
 RING_FUNC(ring_tensor_repeat_rows) {
     tensor_t *Src, *Dest;
     int nTimes;
-    int i;
-    size_t chunk_bytes;
 
     if (RING_API_PARACOUNT != 3) {
         RING_API_ERROR(RING_API_MISS3PARA);
@@ -1942,19 +2232,7 @@ RING_FUNC(ring_tensor_repeat_rows) {
         return;
     }
 
-    // Calculation
-    chunk_bytes = Src->size * sizeof(double);
-    
-    // Execution: Parallel Block Copy
-    // If nTimes is large (large batch), we parallelize the copy
-    #pragma omp parallel for if(nTimes > 4)
-    for (i = 0; i < nTimes; i++) {
-        // Calculate offset for this block
-        double *dest_ptr = &Dest->data[i * Src->size];
-        
-        // Copy the source block
-        memcpy(dest_ptr, Src->data, chunk_bytes);
-    }
+    internal_repeat_rows(Src, Dest, nTimes);
 }
 
 /*
@@ -1981,323 +2259,236 @@ RING_FUNC(ring_tensor_from_memory) {
     t->rows = rows;
     t->cols = cols;
     t->size = rows * cols;
-    t->ndim = 2;
-    t->shape[0]=1; t->shape[1]=1; t->shape[2]=rows; t->shape[3]=cols;
+    t->is_owner = 0; // Important: we don't own this memory
 
-    // 4. Return with Special Destructor
-    RING_API_RETMANAGEDCPOINTER(t, RING_VM_POINTER_TENSOR, ring_tensor_free_struct_only);
+    RING_API_RETCPOINTER(t, RING_VM_POINTER_TENSOR);
 }
 
-/*
-** Linear Causal Attention (Recurrent / The Geomancy Kernel)
-** Logic: S_i = S_{i-1} + (K_i * V_i^T)
-**        O_i = (Q_i * S_i) / (Q_i * Z_i)
-**
-** This guarantees that token 'i' cannot see 'i+1'.
-*/
+void internal_attention_linear_causal(tensor_t *Q, tensor_t *K, tensor_t *V, tensor_t *Out, double scale, int batch) {
+    int seq_len = Q->rows / batch;
+    int dim = Q->cols;
+    int b, t, i, j;
+    #pragma omp parallel for private(b, t, i, j)
+    for (b = 0; b < batch; b++) {
+        int offset = b * seq_len * dim;
+        double *S = (double *)calloc(dim * dim, sizeof(double));
+        double *Z = (double *)calloc(dim, sizeof(double));
+        if (!S || !Z) continue;
+        for (t = 0; t < seq_len; t++) {
+            double *qt = &Q->data[offset + t*dim];
+            double *kt = &K->data[offset + t*dim];
+            double *vt = &V->data[offset + t*dim];
+            double *ot = &Out->data[offset + t*dim];
+            for (i = 0; i < dim; i++) {
+                double k_val = kt[i];
+                Z[i] += k_val;
+                for (j = 0; j < dim; j++) S[i * dim + j] += k_val * vt[j];
+            }
+            double den = 0.0;
+            for (i = 0; i < dim; i++) den += qt[i] * Z[i];
+            if (den < 1e-6) den = 1e-6;
+            for (j = 0; j < dim; j++) {
+                double num = 0.0;
+                for (i = 0; i < dim; i++) num += qt[i] * S[i * dim + j];
+                ot[j] = (num / den) * scale;
+            }
+        }
+        free(S); free(Z);
+    }
+}
+
+void internal_attention_linear_optimized(tensor_t *Q, tensor_t *K, tensor_t *V, tensor_t *Out, double scale, int batch) {
+    int seq = Q->rows / batch;
+    int dim = Q->cols;
+    int b, i, j, k, ii, jj, kk;
+    #pragma omp parallel for private(b, i, j, k, ii, jj, kk)
+    for (b = 0; b < batch; b++) {
+        double *Context = (double *)calloc(dim * dim, sizeof(double));
+        double *qb = &Q->data[b * seq * dim];
+        double *kb = &K->data[b * seq * dim];
+        double *vb = &V->data[b * seq * dim];
+        double *ob = &Out->data[b * seq * dim];
+        for (ii = 0; ii < dim; ii += TILE_SIZE) {
+            for (kk = 0; kk < seq; kk += TILE_SIZE) {
+                for (jj = 0; jj < dim; jj += TILE_SIZE) {
+                    int i_lim = (ii + TILE_SIZE < dim) ? ii + TILE_SIZE : dim;
+                    int k_lim = (kk + TILE_SIZE < seq) ? kk + TILE_SIZE : seq;
+                    int j_lim = (jj + TILE_SIZE < dim) ? jj + TILE_SIZE : dim;
+                    for (i = ii; i < i_lim; i++) {
+                        for (k = kk; k < k_lim; k++) {
+                            double k_val = kb[k * dim + i];
+                            for (j = jj; j < j_lim; j++) Context[i * dim + j] += k_val * vb[k * dim + j];
+                        }
+                    }
+                }
+            }
+        }
+        for (ii = 0; ii < seq; ii += TILE_SIZE) {
+            for (kk = 0; kk < dim; kk += TILE_SIZE) {
+                for (jj = 0; jj < dim; jj += TILE_SIZE) {
+                    int i_lim = (ii + TILE_SIZE < seq) ? ii + TILE_SIZE : seq;
+                    int k_lim = (kk + TILE_SIZE < dim) ? kk + TILE_SIZE : dim;
+                    int j_lim = (jj + TILE_SIZE < dim) ? jj + TILE_SIZE : dim;
+                    for (i = ii; i < i_lim; i++) {
+                        for (k = kk; k < k_lim; k++) {
+                            double q_val = qb[i * dim + k];
+                            for (j = jj; j < j_lim; j++) ob[i * dim + j] += q_val * Context[k * dim + j] * scale;
+                        }
+                    }
+                }
+            }
+        }
+        free(Context);
+    }
+}
+
+void internal_attention_linear_backward(tensor_t *Q, tensor_t *K, tensor_t *V, tensor_t *G, tensor_t *dQ, tensor_t *dK, tensor_t *dV, double scale, int batch) {
+    int dim = Q->cols;
+    int seq = Q->rows / batch;
+    int b, t, i, j;
+    #pragma omp parallel for private(b, t, i, j)
+    for (b = 0; b < batch; b++) {
+        int offset = b * seq * dim;
+        double *S_History = (double *)malloc(seq * dim * dim * sizeof(double));
+        double *S = (double *)calloc(dim * dim, sizeof(double));
+        for (t = 0; t < seq; t++) {
+            double *kt = &K->data[offset + t*dim];
+            double *vt = &V->data[offset + t*dim];
+            for (i = 0; i < dim; i++) {
+                for (j = 0; j < dim; j++) S[i*dim + j] += kt[i] * vt[j];
+            }
+            memcpy(&S_History[t*dim*dim], S, dim*dim*sizeof(double));
+        }
+        free(S);
+        double *dS = (double *)calloc(dim * dim, sizeof(double));
+        for (t = seq - 1; t >= 0; t--) {
+            double *qt  = &Q->data[offset + t*dim];
+            double *kt  = &K->data[offset + t*dim];
+            double *vt  = &V->data[offset + t*dim];
+            double *gt  = &G->data[offset + t*dim];
+            double *dqt = &dQ->data[offset + t*dim];
+            double *dkt = &dK->data[offset + t*dim];
+            double *dvt = &dV->data[offset + t*dim];
+            double *St = &S_History[t*dim*dim];
+            for (i = 0; i < dim; i++) {
+                double val = 0.0;
+                for (j = 0; j < dim; j++) val += gt[j] * St[i*dim + j];
+                dqt[i] = val * scale;
+            }
+            for (i = 0; i < dim; i++) {
+                for (j = 0; j < dim; j++) dS[i*dim + j] += qt[i] * gt[j];
+            }
+            for (i = 0; i < dim; i++) {
+                double val = 0.0;
+                for (j = 0; j < dim; j++) val += dS[i*dim + j] * vt[j];
+                dkt[i] = val * scale;
+            }
+            for (i = 0; i < dim; i++) {
+                double val = 0.0;
+                for (j = 0; j < dim; j++) val += dS[j*dim + i] * kt[j];
+                dvt[i] = val * scale;
+            }
+        }
+        free(S_History); free(dS);
+    }
+}
+
+void internal_attention_linear_global_backward(tensor_t *Q, tensor_t *K, tensor_t *V, tensor_t *dOut, tensor_t *dQ, tensor_t *dK, tensor_t *dV, double scale, int batch) {
+    int seq = Q->rows / batch;
+    int dim = Q->cols;
+    int b, t, i, j;
+    #pragma omp parallel for private(b, t, i, j)
+    for (b = 0; b < batch; b++) {
+        int offset = b * seq * dim;
+        double *C_mat  = (double *)calloc(dim * dim, sizeof(double));
+        double *dC_mat = (double *)calloc(dim * dim, sizeof(double));
+        if (!C_mat || !dC_mat) continue;
+        for (t = 0; t < seq; t++) {
+            double *kt = &K->data[offset + t*dim];
+            double *vt = &V->data[offset + t*dim];
+            double *qt = &Q->data[offset + t*dim];
+            double *gt = &dOut->data[offset + t*dim];
+            for (i = 0; i < dim; i++) {
+                for (j = 0; j < dim; j++) {
+                    C_mat[i*dim + j] += kt[i] * vt[j];
+                    dC_mat[i*dim + j] += qt[i] * gt[j];
+                }
+            }
+        }
+        for (t = 0; t < seq; t++) {
+            double *dqt = &dQ->data[offset + t*dim];
+            double *dkt = &dK->data[offset + t*dim];
+            double *dvt = &dV->data[offset + t*dim];
+            double *vt = &V->data[offset + t*dim];
+            double *kt = &K->data[offset + t*dim];
+            double *gt = &dOut->data[offset + t*dim];
+            for (i = 0; i < dim; i++) {
+                double sum_dq = 0.0;
+                for (j = 0; j < dim; j++) sum_dq += gt[j] * C_mat[j*dim + i];
+                dqt[i] = sum_dq * scale;
+                double sum_dk = 0.0;
+                for (j = 0; j < dim; j++) sum_dk += vt[j] * dC_mat[j*dim + i];
+                dkt[i] = sum_dk * scale;
+                double sum_dv = 0.0;
+                for (j = 0; j < dim; j++) sum_dv += kt[j] * dC_mat[i*dim + j];
+                dvt[i] = sum_dv * scale;
+            }
+        }
+        free(C_mat); free(dC_mat);
+    }
+}
+
 RING_FUNC(ring_tensor_attention_linear_causal) {
     tensor_t *Q = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
     tensor_t *K = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
     tensor_t *V = (tensor_t *)RING_API_GETCPOINTER(3, RING_VM_POINTER_TENSOR);
     tensor_t *Out = (tensor_t *)RING_API_GETCPOINTER(4, RING_VM_POINTER_TENSOR);
-    
-    // Params: Scale is implied or pre-applied to Q/K? 
-    // Usually Linear Attention doesn't use scale 1/sqrt(d), but feature map phi(x).
-    // We assume Q and K are already passed through ReLU.
-    // If you pass scale, we can apply it.
-    double scale = 1.0; 
-    if (RING_API_PARACOUNT >= 5) scale = RING_API_GETNUMBER(5);
-
-    int batch = 1; 
-    if (RING_API_PARACOUNT >= 6) batch = (int)RING_API_GETNUMBER(6);
-
-    int seq_len = Q->rows / batch;
-    int dim = Q->cols;
-    
-    int b, t, i, j;
-    double eps = 1e-6;
-
-    // Parallelize over Batches (Safe)
-    #pragma omp parallel for private(b, t, i, j)
-    for (b = 0; b < batch; b++) {
-        
-        // Offset for current batch
-        int offset = b * seq_len * dim;
-        
-        // State Matrix S (dim x dim) - Initialized to 0
-        double *S = (double *)calloc(dim * dim, sizeof(double));
-        // Normalizer Z (dim) - Initialized to 0
-        double *Z = (double *)calloc(dim, sizeof(double));
-        
-        if (!S || !Z) continue; // Safety skip
-
-        // Iterate Time Steps (Sequential per batch)
-        for (t = 0; t < seq_len; t++) {
-            
-            double *qt = &Q->data[offset + t*dim];
-            double *kt = &K->data[offset + t*dim];
-            double *vt = &V->data[offset + t*dim];
-            double *ot = &Out->data[offset + t*dim];
-            
-            // 1. Update State: S += K_t^T * V_t
-            // Also Update Z += K_t
-            for (i = 0; i < dim; i++) {
-                double k_val = kt[i];
-                Z[i] += k_val;
-                
-                for (j = 0; j < dim; j++) {
-                    S[i * dim + j] += k_val * vt[j];
-                }
-            }
-            
-            // 2. Compute Output: O_t = (Q_t * S) / (Q_t * Z)
-            double den = 0.0;
-            for (i = 0; i < dim; i++) den += qt[i] * Z[i];
-            
-            if (den < eps) den = eps; // Avoid div/0
-            
-            for (j = 0; j < dim; j++) { // For each output dimension
-                double num = 0.0;
-                for (i = 0; i < dim; i++) {
-                    // num += qt[i] * S[i][j]
-                    num += qt[i] * S[i * dim + j];
-                }
-                ot[j] = (num / den) * scale; // Apply scale if needed
-            }
-        }
-        
-        free(S);
-        free(Z);
-    }
+    double scale = 1.0; if (RING_API_PARACOUNT >= 5) scale = RING_API_GETNUMBER(5);
+    int batch = 1; if (RING_API_PARACOUNT >= 6) batch = (int)RING_API_GETNUMBER(6);
+    internal_attention_linear_causal(Q, K, V, Out, scale, batch);
 }
 
-/*
-** Optimized Linear Attention (Matrix Form + Tiling)
-** Formula: O = Q * (K^T * V)
-** Complexity: O(N) instead of O(N^2)
-** Optimization: Tiled Loops for Cache Locality
-*/ 
 RING_FUNC(ring_tensor_attention_linear_optimized) {
     tensor_t *Q = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
     tensor_t *K = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
     tensor_t *V = (tensor_t *)RING_API_GETCPOINTER(3, RING_VM_POINTER_TENSOR);
     tensor_t *Out = (tensor_t *)RING_API_GETCPOINTER(4, RING_VM_POINTER_TENSOR);
     double scale = RING_API_GETNUMBER(5);
-    int batch = (int)RING_API_GETNUMBER(6); // Explicit Batch
-    
-    int seq = Q->rows / batch;
-    int dim = Q->cols;
-    
-    // Pointers
-    int b, i, j, k, ii, jj, kk;
-    
-    // Parallelize over Batches
-    #pragma omp parallel for private(b, i, j, k, ii, jj, kk)
-    for (b = 0; b < batch; b++) {
-        
-        // 1. Allocate Global Context Matrix (d x d)
-        // This replaces the N x N matrix. Ideally small (64x64).
-        double *Context = (double *)calloc(dim * dim, sizeof(double));
-        
-        // Offsets for this batch
-        double *qb = &Q->data[b * seq * dim];
-        double *kb = &K->data[b * seq * dim];
-        double *vb = &V->data[b * seq * dim];
-        double *ob = &Out->data[b * seq * dim];
-
-        // --- STEP 1: Compute Context = K^T * V ---
-        // Shape: (d, N) * (N, d) -> (d, d)
-        // TILED IMPLEMENTATION
-        
-        for (ii = 0; ii < dim; ii += TILE_SIZE) {
-            for (kk = 0; kk < seq; kk += TILE_SIZE) {
-                for (jj = 0; jj < dim; jj += TILE_SIZE) {
-                    
-                    // Mini-Block Processing
-                    int i_lim = (ii + TILE_SIZE < dim) ? ii + TILE_SIZE : dim;
-                    int k_lim = (kk + TILE_SIZE < seq) ? kk + TILE_SIZE : seq;
-                    int j_lim = (jj + TILE_SIZE < dim) ? jj + TILE_SIZE : dim;
-
-                    for (i = ii; i < i_lim; i++) {
-                        for (k = kk; k < k_lim; k++) {
-                            double k_val = kb[k * dim + i]; // Transposed access
-                            
-                            for (j = jj; j < j_lim; j++) {
-                                Context[i * dim + j] += k_val * vb[k * dim + j];
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // --- STEP 2: Compute Output = Q * Context ---
-        // Shape: (N, d) * (d, d) -> (N, d)
-        // TILED IMPLEMENTATION
-        
-        for (ii = 0; ii < seq; ii += TILE_SIZE) {
-            for (kk = 0; kk < dim; kk += TILE_SIZE) {
-                for (jj = 0; jj < dim; jj += TILE_SIZE) {
-                    
-                    int i_lim = (ii + TILE_SIZE < seq) ? ii + TILE_SIZE : seq;
-                    int k_lim = (kk + TILE_SIZE < dim) ? kk + TILE_SIZE : dim;
-                    int j_lim = (jj + TILE_SIZE < dim) ? jj + TILE_SIZE : dim;
-                    
-                    for (i = ii; i < i_lim; i++) {
-                        for (k = kk; k < k_lim; k++) {
-                            double q_val = qb[i * dim + k];
-                            
-                            for (j = jj; j < j_lim; j++) {
-                                ob[i * dim + j] += (q_val * Context[k * dim + j]);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        
-        // Apply Scale
-        if (scale != 1.0) {
-            for(i=0; i < seq*dim; i++) ob[i] *= scale;
-        }
-
-        free(Context);
-    }
+    int batch = (int)RING_API_GETNUMBER(6);
+    internal_attention_linear_optimized(Q, K, V, Out, scale, batch);
 }
 
-/*
-** Optimized Backward for Linear Causal Attention
-** Formula: O = Q * (CumSum(K^T * V))
-** Recomputes 'S' on the fly to save memory.
-*/
 RING_FUNC(ring_tensor_attention_linear_backward) {
-    tensor_t *Q  = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
-    tensor_t *K  = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
-    tensor_t *V  = (tensor_t *)RING_API_GETCPOINTER(3, RING_VM_POINTER_TENSOR);
-    tensor_t *G  = (tensor_t *)RING_API_GETCPOINTER(4, RING_VM_POINTER_TENSOR); // Grad Output
-    
-    tensor_t *dQ = (tensor_t *)RING_API_GETCPOINTER(5, RING_VM_POINTER_TENSOR);
-    tensor_t *dK = (tensor_t *)RING_API_GETCPOINTER(6, RING_VM_POINTER_TENSOR);
-    tensor_t *dV = (tensor_t *)RING_API_GETCPOINTER(7, RING_VM_POINTER_TENSOR);
-    
-    double scale = RING_API_GETNUMBER(8);
-    int batch    = (int)RING_API_GETNUMBER(9);
-    
-    int dim = Q->cols;
-    int seq = Q->rows / batch;
-    
-    int b, t, i, j;
-    
-    // Parallelize over Batches
-    #pragma omp parallel for private(b, t, i, j)
-    for (b = 0; b < batch; b++) {
-        
-        int offset = b * seq * dim;
-        
-        // 1. Recompute States (Forward Pass) to store History
-        // We need S_t at every step to calculate dQ_t
-        // Size: Seq * Dim * Dim. This is RAM heavy but necessary for speed.
-        double *S_History = (double *)malloc(seq * dim * dim * sizeof(double));
-        
-        // Temp State S
-        double *S = (double *)calloc(dim * dim, sizeof(double));
-        
-        for (t = 0; t < seq; t++) {
-            double *kt = &K->data[offset + t*dim];
-            double *vt = &V->data[offset + t*dim];
-            
-            // S += k^T * v
-            for (i = 0; i < dim; i++) {
-                for (j = 0; j < dim; j++) {
-                    S[i*dim + j] += kt[i] * vt[j];
-                }
-            }
-            
-            // Store S_t
-            memcpy(&S_History[t*dim*dim], S, dim*dim*sizeof(double));
-        }
-        free(S);
-        
-        // 2. Backward Pass (Reverse Time)
-        // dS accumulates gradients flowing back from future steps
-        double *dS = (double *)calloc(dim * dim, sizeof(double));
-        
-        for (t = seq - 1; t >= 0; t--) {
-            double *qt  = &Q->data[offset + t*dim];
-            double *kt  = &K->data[offset + t*dim];
-            double *vt  = &V->data[offset + t*dim];
-            double *gt  = &G->data[offset + t*dim];
-            
-            double *dqt = &dQ->data[offset + t*dim];
-            double *dkt = &dK->data[offset + t*dim];
-            double *dvt = &dV->data[offset + t*dim];
-            
-            // Retrieve S at this step
-            double *St = &S_History[t*dim*dim];
-            
-            // A. Compute dQ_t = G_t * S_t^T
-            for (i = 0; i < dim; i++) {
-                double val = 0.0;
-                for (j = 0; j < dim; j++) {
-                    val += gt[j] * St[i*dim + j]; // S is (dim, dim)
-                }
-                dqt[i] = val * scale;
-            }
-            
-            // B. Update dS += G_t^T * Q_t
-            for (i = 0; i < dim; i++) {
-                for (j = 0; j < dim; j++) {
-                    dS[i*dim + j] += qt[i] * gt[j];
-                }
-            }
-            
-            // C. Compute dK_t = dS * V_t
-            for (i = 0; i < dim; i++) {
-                double val = 0.0;
-                for (j = 0; j < dim; j++) {
-                    val += dS[i*dim + j] * vt[j];
-                }
-                dkt[i] = val * scale;
-            }
-            
-            // D. Compute dV_t = dS^T * K_t
-            for (i = 0; i < dim; i++) {
-                double val = 0.0;
-                for (j = 0; j < dim; j++) {
-                    val += dS[j*dim + i] * kt[j];
-                }
-                dvt[i] = val * scale;
-            }
-        }
-        
-        free(S_History);
-        free(dS);
-    }
-}
-
-/*
-** Multi-Head Attention Kernel (The All-In-One)
-** Input: Q, K, V (Batch, Seq, Dim) -> where Dim = Heads * HeadDim
-** Performs: Split Heads -> Attention -> Merge Heads
-*/
-RING_FUNC(ring_tensor_attention_multihead) {
     tensor_t *Q = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
     tensor_t *K = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
     tensor_t *V = (tensor_t *)RING_API_GETCPOINTER(3, RING_VM_POINTER_TENSOR);
-    tensor_t *Out = (tensor_t *)RING_API_GETCPOINTER(4, RING_VM_POINTER_TENSOR);
-    
-    double scale = RING_API_GETNUMBER(5);
-    int batch    = (int)RING_API_GETNUMBER(6);
-    int seq      = (int)RING_API_GETNUMBER(7);
-    int heads    = (int)RING_API_GETNUMBER(8);
-    int is_causal= (int)RING_API_GETNUMBER(9);
-    
+    tensor_t *G = (tensor_t *)RING_API_GETCPOINTER(4, RING_VM_POINTER_TENSOR);
+    tensor_t *dQ = (tensor_t *)RING_API_GETCPOINTER(5, RING_VM_POINTER_TENSOR);
+    tensor_t *dK = (tensor_t *)RING_API_GETCPOINTER(6, RING_VM_POINTER_TENSOR);
+    tensor_t *dV = (tensor_t *)RING_API_GETCPOINTER(7, RING_VM_POINTER_TENSOR);
+    double scale = RING_API_GETNUMBER(8);
+    int batch = (int)RING_API_GETNUMBER(9);
+    internal_attention_linear_backward(Q, K, V, G, dQ, dK, dV, scale, batch);
+}
+
+RING_FUNC(ring_tensor_attention_linear_global_backward) {
+    tensor_t *Q = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    tensor_t *K = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
+    tensor_t *V = (tensor_t *)RING_API_GETCPOINTER(3, RING_VM_POINTER_TENSOR);
+    tensor_t *dOut = (tensor_t *)RING_API_GETCPOINTER(4, RING_VM_POINTER_TENSOR);
+    tensor_t *dQ = (tensor_t *)RING_API_GETCPOINTER(5, RING_VM_POINTER_TENSOR);
+    tensor_t *dK = (tensor_t *)RING_API_GETCPOINTER(6, RING_VM_POINTER_TENSOR);
+    tensor_t *dV = (tensor_t *)RING_API_GETCPOINTER(7, RING_VM_POINTER_TENSOR);
+    double scale = RING_API_GETNUMBER(8);
+    int batch = (int)RING_API_GETNUMBER(9);
+    internal_attention_linear_global_backward(Q, K, V, dOut, dQ, dK, dV, scale, batch);
+}
+
+/** Performs: Split Heads -> Attention -> Merge Heads
+*/
+void internal_attention_multihead(tensor_t *Q, tensor_t *K, tensor_t *V, tensor_t *Out, double scale, int batch, int seq, int heads, int is_causal) {
     int dim = Q->cols; 
     int head_dim = dim / heads;
-    
-    if (dim % heads != 0) { RING_API_ERROR("Dim not divisible by heads"); return; }
-    
-    // تعريف المتغيرات خارج الحلقة ليتوافق مع MSVC
     int task, b, h, i, j, k;
     int total_tasks = batch * heads;
     
@@ -2306,8 +2497,8 @@ RING_FUNC(ring_tensor_attention_multihead) {
         b = task / heads;
         h = task % heads;
         
-        double *scores = (double *)malloc(seq * sizeof(double));
-        
+        double scores_stack[256];
+        double *scores = (seq <= 256) ? scores_stack : (double *)malloc(seq * sizeof(double));
         if (scores) {
             int batch_offset = b * seq * dim;
             int head_offset  = h * head_dim; 
@@ -2354,39 +2545,14 @@ RING_FUNC(ring_tensor_attention_multihead) {
                     }
                 }
             }
-            free(scores);
+            if (seq > 256) free(scores);
         }
     }
 }
 
-
-
-/*
-** Multi-Head Attention Backward (The Master Kernel)
-** Recomputes Scores (S) to save memory, calculates exact gradients.
-** Inputs: Q, K, V, GradOut
-** Outputs: dQ, dK, dV
-*/
-RING_FUNC(ring_tensor_attention_multihead_backward) {
-    tensor_t *Q = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
-    tensor_t *K = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
-    tensor_t *V = (tensor_t *)RING_API_GETCPOINTER(3, RING_VM_POINTER_TENSOR);
-    tensor_t *dOut = (tensor_t *)RING_API_GETCPOINTER(4, RING_VM_POINTER_TENSOR);
-    
-    tensor_t *dQ = (tensor_t *)RING_API_GETCPOINTER(5, RING_VM_POINTER_TENSOR);
-    tensor_t *dK = (tensor_t *)RING_API_GETCPOINTER(6, RING_VM_POINTER_TENSOR);
-    tensor_t *dV = (tensor_t *)RING_API_GETCPOINTER(7, RING_VM_POINTER_TENSOR);
-    
-    double scale = RING_API_GETNUMBER(8);
-    int batch    = (int)RING_API_GETNUMBER(9);
-    int seq      = (int)RING_API_GETNUMBER(10);
-    int heads    = (int)RING_API_GETNUMBER(11);
-    int is_causal= (int)RING_API_GETNUMBER(12);
-    
+void internal_attention_multihead_backward(tensor_t *Q, tensor_t *K, tensor_t *V, tensor_t *dOut, tensor_t *dQ, tensor_t *dK, tensor_t *dV, double scale, int batch, int seq, int heads, int is_causal) {
     int dim = Q->cols;
     int head_dim = dim / heads;
-    
-    // تعريف المتغيرات خارج الحلقة لتوافق MSVC
     int task, b, h, i, j, k;
     int total_tasks = batch * heads;
 
@@ -2402,7 +2568,6 @@ RING_FUNC(ring_tensor_attention_multihead_backward) {
         double *dS = (double *)malloc(seq * seq * sizeof(double));
         
         if (S && dS) {
-            
             // --- 1. Recompute Forward ---
             for (i = 0; i < seq; i++) {
                 double *qi = &Q->data[offset + i*dim + head_off];
@@ -2509,18 +2674,27 @@ RING_FUNC(ring_tensor_attention_multihead_backward) {
                 }
             }
             
-            free(S);
-            free(dS);
+            free(S); free(dS);
         }
     }
 }
 
-/*
-** Linear Global Attention Backward
-** Exact gradient calculation for O(N) attention.
-** Recomputes Context (K^T * V) to save memory.
-*/
-RING_FUNC(ring_tensor_attention_linear_global_backward) {
+RING_FUNC(ring_tensor_attention_multihead) {
+    tensor_t *Q = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    tensor_t *K = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
+    tensor_t *V = (tensor_t *)RING_API_GETCPOINTER(3, RING_VM_POINTER_TENSOR);
+    tensor_t *Out = (tensor_t *)RING_API_GETCPOINTER(4, RING_VM_POINTER_TENSOR);
+    
+    double scale = RING_API_GETNUMBER(5);
+    int batch    = (int)RING_API_GETNUMBER(6);
+    int seq      = (int)RING_API_GETNUMBER(7);
+    int heads    = (int)RING_API_GETNUMBER(8);
+    int is_causal= (int)RING_API_GETNUMBER(9);
+    
+    internal_attention_multihead(Q, K, V, Out, scale, batch, seq, heads, is_causal);
+}
+
+RING_FUNC(ring_tensor_attention_multihead_backward) {
     tensor_t *Q = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
     tensor_t *K = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
     tensor_t *V = (tensor_t *)RING_API_GETCPOINTER(3, RING_VM_POINTER_TENSOR);
@@ -2532,84 +2706,14 @@ RING_FUNC(ring_tensor_attention_linear_global_backward) {
     
     double scale = RING_API_GETNUMBER(8);
     int batch    = (int)RING_API_GETNUMBER(9);
+    int seq      = (int)RING_API_GETNUMBER(10);
+    int heads    = (int)RING_API_GETNUMBER(11);
+    int is_causal= (int)RING_API_GETNUMBER(12);
     
-    int seq = Q->rows / batch;
-    int dim = Q->cols;
-    
-    int b, t, i, j;
-
-    #pragma omp parallel for private(b, t, i, j)
-    for (b = 0; b < batch; b++) {
-        int offset = b * seq * dim;
-        
-        // Temp Buffers (d x d)
-        // C_mat = K^T * V
-        // dC_mat = Q^T * dOut
-        double *C_mat  = (double *)calloc(dim * dim, sizeof(double));
-        double *dC_mat = (double *)calloc(dim * dim, sizeof(double));
-        
-        if (!C_mat || !dC_mat) continue; // Safety
-
-        // --- 1. Recompute C = K^T * V ---
-        // And simultaneously partial compute dC = Q^T * dOut
-        // We iterate sequence once to build these small matrices
-        
-        for (t = 0; t < seq; t++) {
-            double *kt = &K->data[offset + t*dim];
-            double *vt = &V->data[offset + t*dim];
-            double *qt = &Q->data[offset + t*dim];
-            double *gt = &dOut->data[offset + t*dim];
-            
-            for (i = 0; i < dim; i++) {
-                for (j = 0; j < dim; j++) {
-                    // C[i][j] += K[t][i] * V[t][j]
-                    C_mat[i*dim + j] += kt[i] * vt[j];
-                    
-                    // dC[i][j] += Q[t][i] * G[t][j]
-                    dC_mat[i*dim + j] += qt[i] * gt[j];
-                }
-            }
-        }
-        
-        // --- 2. Compute Gradients ---
-        for (t = 0; t < seq; t++) {
-            double *dqt = &dQ->data[offset + t*dim];
-            double *dkt = &dK->data[offset + t*dim];
-            double *dvt = &dV->data[offset + t*dim];
-            
-            double *vt = &V->data[offset + t*dim];
-            double *kt = &K->data[offset + t*dim];
-            double *gt = &dOut->data[offset + t*dim];
-
-            for (i = 0; i < dim; i++) {
-                
-                // dQ = dOut * C^T
-                double sum_dq = 0.0;
-                for (j = 0; j < dim; j++) {
-                    sum_dq += gt[j] * C_mat[j*dim + i]; // C[j][i] is C^T
-                }
-                dqt[i] = sum_dq * scale;
-                
-                // dK = V * dC^T
-                double sum_dk = 0.0;
-                for (j = 0; j < dim; j++) {
-                    sum_dk += vt[j] * dC_mat[j*dim + i]; // dC[j][i]
-                }
-                dkt[i] = sum_dk * scale;
-                
-                // dV = K * dC
-                double sum_dv = 0.0;
-                for (j = 0; j < dim; j++) {
-                    sum_dv += kt[j] * dC_mat[i*dim + j];
-                }
-                dvt[i] = sum_dv * scale;
-            }
-        }
-        
-        free(C_mat);
-        free(dC_mat);
-    }
+    internal_attention_multihead_backward(Q, K, V, dOut, dQ, dK, dV, scale, batch, seq, heads, is_causal);
 }
+
+/* Linear Global Attention Backward moved to internal kernel */
 
 /*
 ** Set One-Hot from Raw Pointer (Turbo Scatter)
@@ -2677,6 +2781,1633 @@ RING_FUNC(ring_tensor_get_data_ptr) {
     RING_API_RETNUMBER((double)(size_t)t->data);
 }
 
+
+
+
+/* ========================================================================== */
+/* GRAPH API IMPLEMENTATION                                                   */
+/* ========================================================================== */
+
+
+RING_FUNC(ring_graph_init) {
+    int i;
+    
+    // Free existing nodes
+    for(i=0; i<GRAPH_SIZE; i++) {
+        if (GRAPH[i] != NULL) {
+            // Free tensors if they were allocated by the graph
+            if (GRAPH[i]->val != NULL && GRAPH[i]->opcode != OP_WEIGHT && GRAPH[i]->opcode != OP_INPUT) {
+                if (GRAPH[i]->val->data != NULL) free(GRAPH[i]->val->data);
+                free(GRAPH[i]->val);
+            }
+            if (GRAPH[i]->grad != NULL) {
+                if (GRAPH[i]->grad->data != NULL) free(GRAPH[i]->grad->data);
+                free(GRAPH[i]->grad);
+            }
+            if (GRAPH[i]->m != NULL) {
+                if (GRAPH[i]->m->data != NULL) free(GRAPH[i]->m->data);
+                free(GRAPH[i]->m);
+            }
+            if (GRAPH[i]->v != NULL) {
+                if (GRAPH[i]->v->data != NULL) free(GRAPH[i]->v->data);
+                free(GRAPH[i]->v);
+            }
+            free(GRAPH[i]);
+        }
+    }
+    
+    GRAPH_SIZE = 0;
+}
+
+RING_FUNC(ring_graph_node) {
+    /*
+    ** Usage: node_id = ring_graph_node(opcode, src1_id, src2_id [, tensor_ptr])
+    ** opcode: من enum OpCode
+    **src1_id, src2_id: Parent node IDs (-1 if none exists)
+    ** tensor_ptr: Optional - for nodes of type OP_WEIGHT or OP_INPUT
+    */
+    
+    if (GRAPH_SIZE >= MAX_NODES) {
+        RING_API_ERROR("Graph size limit reached");
+        return;
+    }
+    
+    int opcode = (int)RING_API_GETNUMBER(1);
+    int src1 = (int)RING_API_GETNUMBER(2);
+    int src2 = (int)RING_API_GETNUMBER(3);
+    // 2. Reading additional transactions (optional)
+    int src3 = -1;
+    double param = 0.0;
+    int heads = 1;
+    int causal = 0;
+    int batch = 1;
+    int seq = 1;
+    
+    if (RING_API_PARACOUNT >= 4) {
+        if (RING_API_ISNUMBER(4)) src3 = (int)RING_API_GETNUMBER(4);
+    }
+    
+    double input_param = 0.0;
+    if (RING_API_PARACOUNT >= 5) {
+        if (RING_API_ISNUMBER(5)) input_param = RING_API_GETNUMBER(5);
+    }
+    if (RING_API_PARACOUNT >= 6) {
+        if (RING_API_ISNUMBER(6)) heads = (int)RING_API_GETNUMBER(6);
+    }
+
+    if (RING_API_PARACOUNT >= 7) {
+        if (RING_API_ISNUMBER(7)) causal = (int)RING_API_GETNUMBER(7);
+    }
+
+    if (RING_API_PARACOUNT >= 8) {
+        if (RING_API_ISNUMBER(8)) batch = (int)RING_API_GETNUMBER(8);
+    }
+
+    if (RING_API_PARACOUNT >= 9) {
+        if (RING_API_ISNUMBER(9)) seq = (int)RING_API_GETNUMBER(9);
+    }
+    
+    int attn_type = 0;
+    if (RING_API_PARACOUNT >= 10) {
+        if (RING_API_ISNUMBER(10)) attn_type = (int)RING_API_GETNUMBER(10);
+    }
+
+    GraphNode *node = (GraphNode*)calloc(1, sizeof(GraphNode));
+    node->id = GRAPH_SIZE;
+    node->opcode = opcode;
+    node->src1_id = src1;
+    node->src2_id = src2;
+    node->src3_id = src3; 
+    node->params[0] = input_param; // We put the value coming from Ring in box 0 (or as you use it).
+    node->params[1] = 0.0;         // We use it for the time counter t in Adam
+    node->params[2] = 0.0;
+    node->params[3] = 0.0;  
+    node->heads = heads;
+    node->causal = causal;
+    node->batch = batch;
+    node->seq = seq;
+    node->attn_type = attn_type;
+    node->val = NULL;
+    node->grad = NULL;
+    node->m = NULL;
+    node->v = NULL;
+    node->trainable = 0;
+
+    if (opcode == OP_WEIGHT) {
+        node->trainable = 1; // This is a weight, therefore it is always trainable.
+    } else {
+        node->trainable = 0;
+    }
+
+    // If the node is of type WEIGHT or INPUT, we take the pointer from Ring.
+    if (opcode == OP_WEIGHT || opcode == OP_INPUT) {
+        if (RING_API_PARACOUNT >= 4 && RING_API_ISCPOINTER(4)) {
+            node->val = (tensor_t*)RING_API_GETCPOINTER(4, RING_VM_POINTER_TENSOR);
+            if (opcode == OP_WEIGHT) node->trainable = 1;
+            
+            // Allocating memory for gradient and optimizer states
+            ensure_tensor_memory(&node->grad, node->val->rows, node->val->cols);
+            ensure_tensor_memory(&node->m, node->val->rows, node->val->cols);
+            ensure_tensor_memory(&node->v, node->val->rows, node->val->cols);
+        }
+    }
+    
+    GRAPH[GRAPH_SIZE++] = node;
+    RING_API_RETNUMBER(node->id);
+}
+
+RING_FUNC(ring_graph_set_input) {
+    /*
+    ** Usage: ring_graph_set_input(node_id, tensor_ptr)
+    ** Assigning input data to a specific node
+    */
+    
+    int node_id = (int)RING_API_GETNUMBER(1);
+    tensor_t *data = (tensor_t*)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
+    
+    if (node_id < 0 || node_id >= GRAPH_SIZE) {
+        RING_API_ERROR("Invalid node ID");
+        return;
+    }
+    
+    GRAPH[node_id]->val = data;
+}
+
+RING_FUNC(ring_graph_get_output) {
+    /*
+    ** Usage: tensor_ptr = ring_graph_get_output(node_id)
+    ** Obtaining the output of a specific node
+    */
+    
+    int node_id = (int)RING_API_GETNUMBER(1);
+    
+    if (node_id < 0 || node_id >= GRAPH_SIZE) {
+        RING_API_ERROR("Invalid node ID");
+        return;
+    }
+    
+    RING_API_RETCPOINTER(GRAPH[node_id]->val, RING_VM_POINTER_TENSOR);
+}
+
+void internal_graph_forward() {
+    int i;
+    GraphNode *node, *src1, *src2, *src3;
+    
+    for(i=0; i<GRAPH_SIZE; i++) {
+        node = GRAPH[i];
+        
+        // Get parent nodes
+        src1 = (node->src1_id >= 0) ? GRAPH[node->src1_id] : NULL;
+        src2 = (node->src2_id >= 0) ? GRAPH[node->src2_id] : NULL;
+        src3 = (node->src3_id >= 0) ? GRAPH[node->src3_id] : NULL;
+        
+        if (node->opcode == OP_INPUT || node->opcode == OP_WEIGHT) continue;
+        
+        switch(node->opcode) {
+            case OP_ADD:
+                if (src1 && src1->val) {
+                    ensure_tensor_memory(&node->val, src1->val->rows, src1->val->cols);
+                    copy_tensor(src1->val, node->val);
+                    if (src2 && src2->val) {
+                        internal_add(node->val, src2->val);
+                    }
+                }
+                break;
+                
+            case OP_SUB:
+                if (src1 && src1->val) {
+                    ensure_tensor_memory(&node->val, src1->val->rows, src1->val->cols);
+                    copy_tensor(src1->val, node->val);
+                    if (src2 && src2->val) {
+                        internal_sub(node->val, src2->val);
+                    }
+                }
+                break;
+                
+            case OP_TENSOR_MUL:
+                if (src1 && src1->val) {
+                    ensure_tensor_memory(&node->val, src1->val->rows, src1->val->cols);
+                    copy_tensor(src1->val, node->val);
+                    if (src2 && src2->val) {
+                        internal_mul_elem(node->val, src2->val);
+                    }
+                }
+                break;
+
+            case OP_TENSOR_DIV:
+                if (src1 && src1->val) {
+                    ensure_tensor_memory(&node->val, src1->val->rows, src1->val->cols);
+                    copy_tensor(src1->val, node->val);
+                    if (src2 && src2->val) {
+                        internal_div(node->val, src2->val);
+                    }
+                }
+                break;
+
+            case OP_SCALAR_MUL:
+                if (src1 && src1->val) {
+                    ensure_tensor_memory(&node->val, src1->val->rows, src1->val->cols);
+                    copy_tensor(src1->val, node->val);
+                    internal_scalar_mul(node->val, node->params[0]);
+                }
+                break;
+
+            case OP_ADD_SCALAR:
+                if (src1 && src1->val) {
+                    ensure_tensor_memory(&node->val, src1->val->rows, src1->val->cols);
+                    copy_tensor(src1->val, node->val);
+                    internal_add_scalar(node->val, node->params[0]);
+                }
+                break;
+
+            case OP_SUB_SCALAR:
+                if (src1 && src1->val) {
+                    ensure_tensor_memory(&node->val, src1->val->rows, src1->val->cols);
+                    copy_tensor(src1->val, node->val);
+                    internal_sub_scalar(node->val, node->params[0]);
+                }
+                break;
+                
+            case OP_MATMUL:
+                if (src1 && src2) {
+                    ensure_tensor_memory(&node->val, src1->val->rows, src2->val->cols);
+                    internal_matmul(src1->val, src2->val, node->val);
+                }
+                break;
+                
+            case OP_RELU:
+                if (src1) {
+                    ensure_tensor_memory(&node->val, src1->val->rows, src1->val->cols);
+                    copy_tensor(src1->val, node->val);
+                    internal_relu(node->val);
+                }
+                break;
+                
+            case OP_SIGMOID:
+                if (src1) {
+                    ensure_tensor_memory(&node->val, src1->val->rows, src1->val->cols);
+                    copy_tensor(src1->val, node->val);
+                    internal_sigmoid(node->val);
+                }
+                break;
+                
+            case OP_TANH:
+                if (src1) {
+                    ensure_tensor_memory(&node->val, src1->val->rows, src1->val->cols);
+                    copy_tensor(src1->val, node->val);
+                    internal_tanh_activation(node->val);
+                }
+                break;
+                
+            case OP_GELU:
+                if (src1) {
+                    ensure_tensor_memory(&node->val, src1->val->rows, src1->val->cols);
+                    copy_tensor(src1->val, node->val);
+                    internal_gelu(node->val);
+                }
+                break;
+                
+            case OP_SOFTMAX:
+                if (src1 && src1->val) {
+                    ensure_tensor_memory(&node->val, src1->val->rows, src1->val->cols);
+                    copy_tensor(src1->val, node->val);
+                    internal_softmax(node->val);
+                }
+                break;
+
+            case OP_SQUARE:
+                if (src1 && src1->val) {
+                    ensure_tensor_memory(&node->val, src1->val->rows, src1->val->cols);
+                    copy_tensor(src1->val, node->val);
+                    internal_square(node->val);
+                }
+                break;
+
+            case OP_SQRT:
+                if (src1 && src1->val) {
+                    ensure_tensor_memory(&node->val, src1->val->rows, src1->val->cols);
+                    copy_tensor(src1->val, node->val);
+                    internal_sqrt_tensor(node->val);
+                }
+                break;
+
+            case OP_EXP:
+                if (src1 && src1->val) {
+                    ensure_tensor_memory(&node->val, src1->val->rows, src1->val->cols);
+                    copy_tensor(src1->val, node->val);
+                    internal_exp(node->val);
+                }
+                break;
+                
+            case OP_TRANSPOSE:
+                if (src1) {
+                    ensure_tensor_memory(&node->val, src1->val->cols, src1->val->rows);
+                    internal_transpose(src1->val, node->val);
+                }
+                break;
+                
+            case OP_MSE:
+                if (src1 && src2) {
+                    ensure_tensor_memory(&node->val, 1, 1);
+                    double loss = internal_mse_loss(src1->val, src2->val);
+                    node->val->data[0] = loss;
+                }
+                break;
+                
+            case OP_CROSSENTROPY:
+                if (src1 && src2) {
+                    ensure_tensor_memory(&node->val, 1, 1);
+                    double loss = internal_crossentropy_loss(src1->val, src2->val);
+                    node->val->data[0] = loss;
+                }
+                break;
+                
+            case OP_EMBEDDING:
+                if (src1 && src1->val && src2 && src2->val) {
+                    int batch = src2->val->rows;
+                    int seq = src2->val->cols;
+                    int dim = src1->val->cols;
+                    ensure_tensor_memory(&node->val, batch * seq, dim);
+                    node->val->rows = batch * seq; 
+                    node->val->cols = dim; 
+                    internal_embedding_forward(src1->val, src2->val, node->val);
+                }
+                break;
+                
+            case OP_LAYERNORM:
+                if (src1 && src1->val && src2 && src2->val) {
+                    ensure_tensor_memory(&node->val, src1->val->rows, src1->val->cols);
+                    copy_tensor(src1->val, node->val);
+                    double eps = node->params[0];
+                    if (eps == 0.0) eps = 1e-5;
+                    
+                    tensor_t *beta_tensor = NULL;
+                    int owns_beta = 0;
+                    if (src3 && src3->val) {
+                        beta_tensor = src3->val;
+                    } else {
+                        beta_tensor = (tensor_t*)calloc(1, sizeof(tensor_t));
+                        beta_tensor->rows = 1; beta_tensor->cols = src1->val->cols; beta_tensor->size = src1->val->cols;
+                        beta_tensor->data = (double*)calloc(beta_tensor->size, sizeof(double));
+                        owns_beta = 1;
+                    }
+                    internal_layernorm(node->val, src2->val, beta_tensor, eps);
+                    if (owns_beta) {
+                        free(beta_tensor->data); free(beta_tensor);
+                    }
+                }
+                break;
+                
+            case OP_DROPOUT:
+                if (src1) {
+                    ensure_tensor_memory(&node->val, src1->val->rows, src1->val->cols);
+                    copy_tensor(src1->val, node->val);
+                    ensure_tensor_memory(&node->m, src1->val->rows, src1->val->cols);
+                    double rate = node->params[0];
+                    if (rate < 0.0) rate = 0.0;
+                    if (rate >= 1.0) rate = 0.9;
+                    int i;
+                    double scale = 1.0 / (1.0 - rate);
+                    for(i=0; i<node->val->size; i++) {
+                        double r = (double)rand() / RAND_MAX;
+                        if (r < rate) {
+                            node->val->data[i] = 0.0;
+                            node->m->data[i] = 0.0;
+                        } else {
+                            node->val->data[i] *= scale;
+                            node->m->data[i] = 1.0;
+                        }
+                    }
+                }
+                break;
+                
+            case OP_ADD_ROW_VEC:
+                if (src1 && src2) {
+                    ensure_tensor_memory(&node->val, src1->val->rows, src1->val->cols);
+                    copy_tensor(src1->val, node->val);
+                    internal_add_row_vec(node->val, src2->val);
+                }
+                break;
+                
+            case OP_ATTENTION:
+                if (src1 && src2 && src3) {
+                    ensure_tensor_memory(&node->val, src1->val->rows, src1->val->cols);
+                    if (node->attn_type == 1) { // Linear Causal
+                        internal_attention_linear_causal(src1->val, src2->val, src3->val, node->val, node->params[0], node->batch);
+                    } else if (node->attn_type == 2) { // Linear Global
+                        internal_attention_linear_optimized(src1->val, src2->val, src3->val, node->val, node->params[0], node->batch);
+                    } else { // Standard Multi-Head
+                        internal_attention_multihead(
+                            src1->val, src2->val, src3->val, node->val,
+                            node->params[0], node->batch, node->seq, node->heads, node->causal
+                        );
+                    }
+                }
+                break;
+                
+            case OP_SUM:
+                if (src1 && src1->val) {
+                    int axis = (int)node->params[0];
+                    int out_rows = (axis == 1) ? src1->val->rows : 1;
+                    int out_cols = (axis == 0) ? src1->val->cols : 1;
+                    ensure_tensor_memory(&node->val, out_rows, out_cols);
+                    internal_sum(src1->val, axis, node->val);
+                }
+                break;
+
+            case OP_MEAN:
+                if (src1 && src1->val) {
+                    int axis = (int)node->params[0];
+                    int out_rows = (axis == 1) ? src1->val->rows : 1;
+                    int out_cols = (axis == 0) ? src1->val->cols : 1;
+                    ensure_tensor_memory(&node->val, out_rows, out_cols);
+                    internal_mean(src1->val, axis, node->val);
+                }
+                break;
+
+            case OP_ARGMAX:
+                if (src1 && src1->val) {
+                    ensure_tensor_memory(&node->val, src1->val->rows, 1);
+                    internal_argmax_rowwise(src1->val, node->val);
+                }
+                break;
+
+            case OP_REPEAT_ROWS:
+                if (src1 && src1->val) {
+                    int nTimes = (int)node->params[0];
+                    ensure_tensor_memory(&node->val, src1->val->rows * nTimes, src1->val->cols);
+                    internal_repeat_rows(src1->val, node->val, nTimes);
+                }
+                break;
+                
+            default:
+                break;
+        }
+    }
+}
+
+RING_FUNC(ring_graph_forward) {
+    internal_graph_forward();
+}
+
+/*
+** Accumulate Gradient safely
+** Adds 'src_grad' to 'node->grad'. Allocates memory if needed.
+*/
+void accumulate_grad(GraphNode *node, tensor_t *src_grad) {
+    if (node == NULL || src_grad == NULL) return;
+
+    // --- DEBUG SPY ---
+   /* static int print_count = 0;
+    if (print_count < 5) {     // We only print the first 5 transfers.
+        double sum = 0;
+        for(int k=0; k<src_grad->size; k++) sum += fabs(src_grad->data[k]);
+        
+        printf(">> ACCUMULATE: Node %d (Op %d) <- Grad Sum: %f\n", 
+               node->id, node->opcode, sum);
+               
+        if (sum > 0) print_count++; 
+    }*/
+    // -----------------
+
+    if (node->grad == NULL) {
+        ensure_tensor_memory(&node->grad, src_grad->rows, src_grad->cols);
+        size_t bytes = src_grad->size * sizeof(double);
+        memcpy(node->grad->data, src_grad->data, bytes);
+    } else {
+        int i;
+        if (node->grad->size != src_grad->size) {
+            printf("ERROR: Grad Accumulate Size Mismatch Node %d\n", node->id);
+            return; 
+        }
+        
+        double *dst = node->grad->data;
+        double *src = src_grad->data;
+        
+        #pragma omp parallel for if(src_grad->size > 2000)
+        for(i=0; i<src_grad->size; i++) {
+            dst[i] += src[i];
+        }
+    }
+}
+
+void internal_graph_backward() {
+    int i;
+    GraphNode *node, *src1, *src2, *src3;
+    tensor_t *tmp1 = NULL, *tmp2 = NULL, *tmp3 = NULL;
+
+    // 1. Zero out all existing gradients
+    for(i=0; i<GRAPH_SIZE; i++) {
+        if (GRAPH[i]->grad) {
+            internal_fill(GRAPH[i]->grad, 0.0);
+        }
+    }
+
+    // 2. Reverse Topological Traversal
+    for(i=GRAPH_SIZE-1; i>=0; i--) {
+        node = GRAPH[i];
+        
+        src1 = (node->src1_id >= 0) ? GRAPH[node->src1_id] : NULL;
+        src2 = (node->src2_id >= 0) ? GRAPH[node->src2_id] : NULL;
+        src3 = (node->src3_id >= 0) ? GRAPH[node->src3_id] : NULL;
+        switch(node->opcode) {
+            // --- Loss Functions ---
+            case OP_MSE:
+                if (src1 && src2) {
+                    ensure_tensor_memory(&tmp1, src1->val->rows, src1->val->cols);
+                    internal_mse_backward(src1->val, src2->val, tmp1);
+                    accumulate_grad(src1, tmp1);
+                    free(tmp1->data); free(tmp1); tmp1 = NULL;
+                }
+                break;
+
+            case OP_CROSSENTROPY:
+                if (src1 && src2) {
+                    ensure_tensor_memory(&tmp1, src1->val->rows, src1->val->cols);
+                    internal_crossentropy_backward(src1->val, src2->val, tmp1);
+                    accumulate_grad(src1, tmp1);
+                    free(tmp1->data); free(tmp1); tmp1 = NULL;
+                }
+                break;
+
+            // --- Math Operations ---
+            case OP_ADD:
+                if (node->grad) {
+                    if (src1) accumulate_grad(src1, node->grad);
+                    if (src2) accumulate_grad(src2, node->grad);
+                }
+                break;
+
+            case OP_SUB:
+                if (node->grad) {
+                    if (src1) accumulate_grad(src1, node->grad);
+                    if (src2) {
+                        ensure_tensor_memory(&tmp1, node->grad->rows, node->grad->cols);
+                        copy_tensor(node->grad, tmp1);
+                        internal_scalar_mul(tmp1, -1.0);
+                        accumulate_grad(src2, tmp1);
+                        free(tmp1->data); free(tmp1); tmp1 = NULL;
+                    }
+                }
+                break;
+
+            case OP_TENSOR_MUL:
+                if (node->grad) {
+                    if (src1 && src2) {
+                        ensure_tensor_memory(&tmp1, node->grad->rows, node->grad->cols);
+                        copy_tensor(node->grad, tmp1);
+                        internal_mul_elem(tmp1, src2->val);
+                        accumulate_grad(src1, tmp1);
+                        copy_tensor(node->grad, tmp1);
+                        internal_mul_elem(tmp1, src1->val);
+                        accumulate_grad(src2, tmp1);
+                        free(tmp1->data); free(tmp1); tmp1 = NULL;
+                    } else if (src1) {
+                        accumulate_grad(src1, node->grad);
+                    }
+                }
+                break;
+
+            case OP_MATMUL:
+                if (src1 && src2) {
+                    if (node->grad) {
+                        ensure_tensor_memory(&tmp1, src2->val->cols, src2->val->rows);
+                        internal_transpose(src2->val, tmp1);
+                        ensure_tensor_memory(&tmp2, src1->val->rows, src1->val->cols);
+                        internal_matmul(node->grad, tmp1, tmp2);
+                        accumulate_grad(src1, tmp2);
+                        free(tmp1->data); free(tmp1); tmp1 = NULL;
+                        free(tmp2->data); free(tmp2); tmp2 = NULL;
+                        ensure_tensor_memory(&tmp1, src1->val->cols, src1->val->rows);
+                        internal_transpose(src1->val, tmp1);
+                        ensure_tensor_memory(&tmp2, src2->val->rows, src2->val->cols);
+                        internal_matmul(tmp1, node->grad, tmp2);
+                        accumulate_grad(src2, tmp2);
+                        free(tmp1->data); free(tmp1); tmp1 = NULL;
+                        free(tmp2->data); free(tmp2); tmp2 = NULL;
+                    }
+                }
+                break;
+            
+            case OP_SCALAR_MUL:
+                // y = x * c  --> dy/dx = dy * c
+                if (node->grad && src1) {
+                    ensure_tensor_memory(&tmp1, node->grad->rows, node->grad->cols);
+                    copy_tensor(node->grad, tmp1);
+                    internal_scalar_mul(tmp1, node->params[0]); // Multiply grad by scalar
+                    accumulate_grad(src1, tmp1);
+                    free(tmp1->data); free(tmp1); tmp1 = NULL;
+                }
+                break;
+
+            case OP_ADD_SCALAR:
+                // y = x + c --> dy/dx = dy
+                if (node->grad && src1) {
+                    accumulate_grad(src1, node->grad);
+                }
+                break;
+
+            case OP_SUB_SCALAR:
+                // y = x - c --> dy/dx = dy
+                if (node->grad && src1) {
+                    accumulate_grad(src1, node->grad);
+                }
+                break;
+
+            case OP_TENSOR_DIV: // Tensor Div
+                 // y = a / b
+                 // da = dy / b
+                 // db = -dy * a / b^2
+                 // (Implementing just da for now as usually div is not used on weights directly in simple models)
+                 // But for completeness:
+                 if (node->grad && src1 && src2) {
+                     // dSrc1
+                     ensure_tensor_memory(&tmp1, node->grad->rows, node->grad->cols);
+                     copy_tensor(node->grad, tmp1);
+                     internal_div(tmp1, src2->val); // grad / src2
+                     accumulate_grad(src1, tmp1);
+                     free(tmp1->data); free(tmp1); tmp1 = NULL;
+                     
+                     // dSrc2 (Complex, skipping for now unless needed)
+                 }
+                 break;
+
+            case OP_TRANSPOSE:
+                if (node->grad && src1) {
+                    ensure_tensor_memory(&tmp1, node->grad->cols, node->grad->rows);
+                    internal_transpose(node->grad, tmp1);
+                    accumulate_grad(src1, tmp1);
+                    free(tmp1->data); free(tmp1); tmp1 = NULL;
+                }
+                break;
+
+            // --- Activations ---
+            case OP_RELU:
+                if (node->grad && src1) {
+                    ensure_tensor_memory(&tmp1, src1->val->rows, src1->val->cols);
+                    copy_tensor(src1->val, tmp1);
+                    internal_relu_prime(tmp1);
+                    internal_mul_elem(tmp1, node->grad);
+                    accumulate_grad(src1, tmp1);
+                    free(tmp1->data); free(tmp1); tmp1 = NULL;
+                }
+                break;
+                
+            case OP_SIGMOID:
+                if (node->grad && src1) {
+                    ensure_tensor_memory(&tmp1, src1->val->rows, src1->val->cols);
+                    copy_tensor(src1->val, tmp1);
+                    internal_sigmoid_prime(tmp1);
+                    internal_mul_elem(tmp1, node->grad);
+                    accumulate_grad(src1, tmp1);
+                    free(tmp1->data); free(tmp1); tmp1 = NULL;
+                }
+                break;
+                
+            case OP_TANH:
+                if (node->grad && src1) {
+                    ensure_tensor_memory(&tmp1, src1->val->rows, src1->val->cols);
+                    copy_tensor(src1->val, tmp1);
+                    internal_tanh_prime(tmp1);
+                    internal_mul_elem(tmp1, node->grad);
+                    accumulate_grad(src1, tmp1);
+                    free(tmp1->data); free(tmp1); tmp1 = NULL;
+                }
+                break;
+
+             case OP_GELU:
+                if (src1) {
+                    ensure_tensor_memory(&node->grad, src1->val->rows, src1->val->cols);
+                    ensure_tensor_memory(&tmp1, src1->val->rows, src1->val->cols);
+                    copy_tensor(src1->val, tmp1);
+                    internal_gelu_prime(tmp1);
+                    internal_mul_elem(tmp1, node->grad);
+                    accumulate_grad(src1, tmp1);
+                    free(tmp1->data); free(tmp1); tmp1 = NULL;
+                }
+                break;
+                
+            case OP_SOFTMAX:
+                if (node->grad && src1 && node->val) { 
+                    // node->val contains the Softmax output (Y), which is what we need for the equation.
+                    // node->grad is (dY)
+                    // tmp1 will be (dX)
+                    
+                    ensure_tensor_memory(&tmp1, src1->val->rows, src1->val->cols);
+                    
+                    // Calling the correct kernel
+                    internal_softmax_backward(node->val, node->grad, tmp1);
+                    
+                    //Derivatives aggregation
+                    accumulate_grad(src1, tmp1);
+                    
+                    free(tmp1->data); free(tmp1); tmp1 = NULL;
+                }
+                break;
+            
+            case OP_EMBEDDING:
+               // Order: (dOut, Ind, dEmb)
+                // node->grad is the derivative coming from the next layer (dOut)
+                // src1 is the indices
+                // src2 is the weights matrix (Embeddings) whose derivative we want to update (dEmb)
+                
+                if (node->grad && src1 && src2) {
+                    // If there is no room for derivatives in the weights, we reserve it.
+                    if (!src2->grad) {
+                        ensure_tensor_memory(&src2->grad, src2->val->rows, src2->val->cols);
+                        internal_fill(src2->grad, 0.0);
+                    }
+                    
+                    // Correct summons
+                    internal_embedding_backward(node->grad, src1->val, src2->grad);
+                }
+                break;
+                
+            case OP_LAYERNORM:
+                if (src1 && src2) {
+                    ensure_tensor_memory(&node->grad, src1->val->rows, src1->val->cols);
+                    double eps = node->params[0];
+                    if (eps == 0.0) eps = 1e-5;
+                    ensure_tensor_memory(&tmp1, src1->val->rows, src1->val->cols); // dX
+                    if (!src2->grad) {
+                        ensure_tensor_memory(&src2->grad, src2->val->rows, src2->val->cols);
+                        internal_fill(src2->grad, 0.0);
+                    }
+                    tensor_t *beta_tensor = NULL;
+                    tensor_t *dBeta_tensor = NULL;
+                    if (src3 && src3->val) {
+                        beta_tensor = src3->val;
+                        if (!src3->grad) {
+                            ensure_tensor_memory(&src3->grad, src3->val->rows, src3->val->cols);
+                            internal_fill(src3->grad, 0.0);
+                        }
+                        dBeta_tensor = src3->grad;
+                    } else {
+                        beta_tensor = (tensor_t*)calloc(1, sizeof(tensor_t));
+                        beta_tensor->rows = 1; beta_tensor->cols = src1->val->cols; beta_tensor->size = src1->val->cols;
+                        beta_tensor->data = (double*)calloc(beta_tensor->size, sizeof(double));
+                        dBeta_tensor = (tensor_t*)calloc(1, sizeof(tensor_t));
+                        dBeta_tensor->rows = 1; dBeta_tensor->cols = src1->val->cols; dBeta_tensor->size = src1->val->cols;
+                        dBeta_tensor->data = (double*)calloc(dBeta_tensor->size, sizeof(double));
+                    }
+                    internal_layernorm_backward(node->grad, src1->val, src2->val, beta_tensor, tmp1, src2->grad, dBeta_tensor, eps);
+                    accumulate_grad(src1, tmp1);
+                    if (!src3 || !src3->val) {
+                        free(beta_tensor->data); free(beta_tensor);
+                        free(dBeta_tensor->data); free(dBeta_tensor);
+                    }
+                    free(tmp1->data); free(tmp1); tmp1 = NULL;
+                }
+                break;
+                
+            case OP_REPEAT_ROWS:
+                if (src1) {
+                    ensure_tensor_memory(&node->grad, node->val->rows, node->val->cols);
+                    ensure_tensor_memory(&tmp1, src1->val->rows, src1->val->cols);
+                    internal_fill(tmp1, 0.0);
+                    int nTimes = (int)node->params[0];
+                    int r, c, t;
+                    for (r = 0; r < src1->val->rows; r++) {
+                        for (t = 0; t < nTimes; t++) {
+                            for (c = 0; c < src1->val->cols; c++) {
+                                tmp1->data[r * src1->val->cols + c] += node->grad->data[(r * nTimes + t) * src1->val->cols + c];
+                            }
+                        }
+                    }
+                    accumulate_grad(src1, tmp1);
+                    free(tmp1->data); free(tmp1); tmp1 = NULL;
+                }
+                break;
+                
+            case OP_ADD_ROW_VEC:
+                if (src1 && src2) {
+                    if (node->grad) {
+                        accumulate_grad(src1, node->grad);
+                        ensure_tensor_memory(&tmp1, 1, src2->val->cols);
+                        internal_sum(node->grad, 0, tmp1);
+                        accumulate_grad(src2, tmp1);
+                        free(tmp1->data); free(tmp1); tmp1 = NULL;
+                    }
+                }
+                break;
+                
+            case OP_ATTENTION:
+                if (node->grad && src1 && src2 && src3) {
+                    ensure_tensor_memory(&tmp1, src1->val->rows, src1->val->cols); // dQ
+                    ensure_tensor_memory(&tmp2, src2->val->rows, src2->val->cols); // dK
+                    ensure_tensor_memory(&tmp3, src3->val->rows, src3->val->cols); // dV
+                    internal_fill(tmp1, 0.0);
+                    internal_fill(tmp2, 0.0);
+                    internal_fill(tmp3, 0.0);
+                    if (node->attn_type == 1) { // Linear Causal
+                        internal_attention_linear_backward(src1->val, src2->val, src3->val, node->grad, tmp1, tmp2, tmp3, node->params[0], node->batch);
+                    } else if (node->attn_type == 2) { // Linear Global
+                        internal_attention_linear_global_backward(src1->val, src2->val, src3->val, node->grad, tmp1, tmp2, tmp3, node->params[0], node->batch);
+                    } else { // Standard Multi-Head
+                        internal_attention_multihead_backward(
+                             src1->val, src2->val, src3->val,
+                             node->grad,
+                             tmp1, tmp2, tmp3,
+                             node->params[0], node->batch, node->seq, node->heads, node->causal
+                        );
+                    }
+                    accumulate_grad(src1, tmp1);
+                    accumulate_grad(src2, tmp2);
+                    accumulate_grad(src3, tmp3);
+                    free(tmp1->data); free(tmp1); tmp1 = NULL;
+                    free(tmp2->data); free(tmp2); tmp2 = NULL;
+                    free(tmp3->data); free(tmp3); tmp3 = NULL;
+                }
+                break;
+                
+            case OP_DROPOUT:
+                if (node->grad && src1) {
+                    ensure_tensor_memory(&tmp1, src1->val->rows, src1->val->cols);
+                    internal_dropout_backward(node->grad, tmp1, node->m, node->params[0]); 
+                    accumulate_grad(src1, tmp1);
+                    free(tmp1->data); free(tmp1); tmp1 = NULL;
+                }
+                break;
+                
+            case OP_SUM:
+                if (node->grad && src1) {
+                    ensure_tensor_memory(&tmp1, src1->val->rows, src1->val->cols);
+                    int axis = (int)node->params[0];
+                    int r, c;
+                    for(r=0; r<src1->val->rows; r++) {
+                        for(c=0; c<src1->val->cols; c++) {
+                            int grad_idx = (axis == 1) ? r : ((axis == 0) ? c : 0);
+                            tmp1->data[r * src1->val->cols + c] = node->grad->data[grad_idx];
+                        }
+                    }
+                    accumulate_grad(src1, tmp1);
+                    free(tmp1->data); free(tmp1); tmp1 = NULL;
+                }
+                break;
+        }
+    }
+}
+
+RING_FUNC(ring_graph_backward) {
+    internal_graph_backward();
+}
+
+RING_FUNC(ring_graph_set_optimizer) {
+    /*
+    ** Usage: graph_set_optimizer(type)
+    ** type: 0 for SGD, 1 for ADAM
+    */
+    if (RING_API_PARACOUNT != 1) {
+        RING_API_ERROR(RING_API_MISS1PARA);
+        return;
+    }
+    GRAPH_OPTIMIZER = (int)RING_API_GETNUMBER(1);
+}
+
+RING_FUNC(ring_graph_run) {
+    int epochs = (int)RING_API_GETNUMBER(1);
+    double lr = RING_API_GETNUMBER(2);
+    double max_norm = (RING_API_PARACOUNT >= 3) ? RING_API_GETNUMBER(3) : 0.0;
+    
+    int e, i;
+    
+    for(e=0; e<epochs; e++) {
+        // 0. Zero Gradients
+        for(i=0; i<GRAPH_SIZE; i++) {
+            if (GRAPH[i]->grad) internal_fill(GRAPH[i]->grad, 0.0);
+        }
+
+        // 1. Forward
+        internal_graph_forward();
+        
+        // 2. Backward
+        internal_graph_backward();
+        
+        // 2.5 Gradient Clipping
+        if (max_norm > 0.0) {
+            double total_norm = 0.0;
+            for(i=0; i<GRAPH_SIZE; i++) {
+                if (GRAPH[i]->grad) {
+                    for(int k=0; k<GRAPH[i]->grad->size; k++) {
+                        double g = GRAPH[i]->grad->data[k];
+                        total_norm += g * g;
+                    }
+                }
+            }
+            total_norm = sqrt(total_norm);
+            if (total_norm > max_norm) {
+                double scale = max_norm / (total_norm + 1e-6);
+                for(i=0; i<GRAPH_SIZE; i++) {
+                    if (GRAPH[i]->trainable && GRAPH[i]->grad) {
+                        for(int k=0; k<GRAPH[i]->grad->size; k++) {
+                            GRAPH[i]->grad->data[k] *= scale;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 3. Optimizer Step
+        for(i=0; i<GRAPH_SIZE; i++) {
+            if (GRAPH[i]->grad && (GRAPH[i]->trainable || GRAPH[i]->opcode == 1)) {
+                GRAPH[i]->params[3] += 1.0; 
+                int t = (int)GRAPH[i]->params[3];
+                if (GRAPH_OPTIMIZER == 1) { // ADAM
+                    if (!GRAPH[i]->m) ensure_tensor_memory(&GRAPH[i]->m, GRAPH[i]->val->rows, GRAPH[i]->val->cols);
+                    if (!GRAPH[i]->v) ensure_tensor_memory(&GRAPH[i]->v, GRAPH[i]->val->rows, GRAPH[i]->val->cols);
+                    internal_adam_update(GRAPH[i]->val, GRAPH[i]->grad, GRAPH[i]->m, GRAPH[i]->v, lr, 0.9, 0.999, 1e-8, t);
+                } else { // SGD
+                    internal_sgd_update(GRAPH[i]->val, GRAPH[i]->grad, lr);
+                }
+            }
+        }
+    }
+}
+
+RING_FUNC(ring_graph_run_buffered) {
+    int input_id    = (int)RING_API_GETNUMBER(1);
+    int target_id   = (int)RING_API_GETNUMBER(2);
+    tensor_t *big_in = (tensor_t *)RING_API_GETCPOINTER(3, RING_VM_POINTER_TENSOR);
+    tensor_t *big_tg = (tensor_t *)RING_API_GETCPOINTER(4, RING_VM_POINTER_TENSOR);
+    int batch_size  = (int)RING_API_GETNUMBER(5);
+    int epochs      = (int)RING_API_GETNUMBER(6);
+    double lr       = RING_API_GETNUMBER(7);
+    double max_norm = RING_API_GETNUMBER(8);
+
+    if (!big_in || !big_tg || input_id < 0 || target_id < 0 || input_id >= GRAPH_SIZE || target_id >= GRAPH_SIZE) {
+        RING_API_RETNUMBER(0.0);
+        return;
+    }
+    if (!GRAPH[input_id] || !GRAPH[target_id]) {
+        RING_API_RETNUMBER(0.0);
+        return;
+    }
+
+    int total_samples = big_in->rows;
+    int seq_len       = big_in->cols;
+    
+    if (batch_size > total_samples) batch_size = total_samples;
+    if (batch_size <= 0) { RING_API_RETNUMBER(0.0); return; }
+
+    int num_batches   = total_samples / batch_size;
+    int i, b, k, e;
+    double total_loss_accum = 0.0;
+    int total_steps = 0;
+
+    // Save original pointers
+    double *orig_in_ptr = GRAPH[input_id]->val->data;
+    double *orig_tg_ptr = GRAPH[target_id]->val->data;
+
+    for(e=0; e < epochs; e++) {
+        for(b=0; b < num_batches; b++) {
+            // 1. Update Input/Target pointers
+            GRAPH[input_id]->val->data  = big_in->data + (b * batch_size * seq_len);
+            GRAPH[target_id]->val->data = big_tg->data + (b * batch_size * seq_len);
+
+            // 2. Standard Graph Step
+            for(i=0; i<GRAPH_SIZE; i++) if (GRAPH[i]->grad) internal_fill(GRAPH[i]->grad, 0.0);
+            
+            internal_graph_forward();
+            internal_graph_backward();
+
+            // Accumulate Loss (Last Node is always Loss)
+            if (GRAPH_SIZE > 0) {
+                total_loss_accum += GRAPH[GRAPH_SIZE-1]->val->data[0];
+                total_steps++;
+            }
+
+            // Clipping
+            if (max_norm > 0.0) {
+                double total_norm = 0.0;
+                for(i=0; i<GRAPH_SIZE; i++) {
+                    if (GRAPH[i]->grad) {
+                        for(k=0; k<GRAPH[i]->grad->size; k++) total_norm += GRAPH[i]->grad->data[k] * GRAPH[i]->grad->data[k];
+                    }
+                }
+                total_norm = sqrt(total_norm);
+                if (total_norm > max_norm) {
+                    double scale = max_norm / (total_norm + 1e-6);
+                    for(i=0; i<GRAPH_SIZE; i++) {
+                        if (GRAPH[i]->trainable && GRAPH[i]->grad) {
+                            for(k=0; k<GRAPH[i]->grad->size; k++) GRAPH[i]->grad->data[k] *= scale;
+                        }
+                    }
+                }
+            }
+
+            // Optimizer
+            for(i=0; i<GRAPH_SIZE; i++) {
+                if (GRAPH[i]->grad && (GRAPH[i]->trainable || GRAPH[i]->opcode == 1)) {
+                    GRAPH[i]->params[3] += 1.0;
+                    int t = (int)GRAPH[i]->params[3];
+                    if (GRAPH_OPTIMIZER == 1) {
+                        if (!GRAPH[i]->m) ensure_tensor_memory(&GRAPH[i]->m, GRAPH[i]->val->rows, GRAPH[i]->val->cols);
+                        if (!GRAPH[i]->v) ensure_tensor_memory(&GRAPH[i]->v, GRAPH[i]->val->rows, GRAPH[i]->val->cols);
+                        internal_adam_update(GRAPH[i]->val, GRAPH[i]->grad, GRAPH[i]->m, GRAPH[i]->v, lr, 0.9, 0.999, 1e-8, t);
+                    } else {
+                        internal_sgd_update(GRAPH[i]->val, GRAPH[i]->grad, lr);
+                    }
+                }
+            }
+        }
+    }
+
+    // Restore original pointers
+    GRAPH[input_id]->val->data  = orig_in_ptr;
+    GRAPH[target_id]->val->data = orig_tg_ptr;
+
+    // Return the average loss
+    if (total_steps > 0) {
+        RING_API_RETNUMBER(total_loss_accum / total_steps);
+    } else {
+        RING_API_RETNUMBER(0.0);
+    }
+}
+
+RING_FUNC(ring_graph_update) {
+    /*
+    ** Usage: graph_update(lr)
+    ** perform optimizer step
+    */
+    double lr = RING_API_GETNUMBER(1);
+    int i;
+    static int step_count = 0;
+    step_count++;
+
+    for(i=0; i<GRAPH_SIZE; i++) {
+        if (GRAPH[i]->trainable && GRAPH[i]->grad != NULL) {
+            if (GRAPH_OPTIMIZER == 1) {
+                // Adam
+                if (!GRAPH[i]->m) ensure_tensor_memory(&GRAPH[i]->m, GRAPH[i]->val->rows, GRAPH[i]->val->cols);
+                if (!GRAPH[i]->v) ensure_tensor_memory(&GRAPH[i]->v, GRAPH[i]->val->rows, GRAPH[i]->val->cols);
+                internal_adam_update(GRAPH[i]->val, GRAPH[i]->grad, GRAPH[i]->m, GRAPH[i]->v, 
+                                     lr, 0.9, 0.999, 1e-8, step_count);
+            } else {
+                // SGD (Default)
+                internal_sgd_update(GRAPH[i]->val, GRAPH[i]->grad, lr);
+            }
+        }
+    }
+}
+
+RING_FUNC(ring_graph_bind_memory) {
+    int node_id = (int)RING_API_GETNUMBER(1);
+    tensor_t *pTensor = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
+    
+    if (GRAPH && node_id >= 0 && node_id < GRAPH_SIZE) {
+        GRAPH[node_id]->val = pTensor;
+        
+        if (GRAPH[node_id]->opcode == OP_WEIGHT) {
+             GRAPH[node_id]->trainable = 1;
+             // Ensure grad is allocated if not already
+             ensure_tensor_memory(&GRAPH[node_id]->grad, pTensor->rows, pTensor->cols);
+        }
+    }
+}
+
+RING_FUNC(ring_graph_bind_grad) {
+    // 1. Get Node ID
+    int node_id = (int)RING_API_GETNUMBER(1);
+    
+    // 2. Get Tensor Pointer
+    tensor_t *pTensor = (tensor_t *)RING_API_GETCPOINTER(2, RING_VM_POINTER_TENSOR);
+    
+    // 3. Validation & Binding
+    if (GRAPH && node_id < GRAPH_SIZE) {
+        GRAPH[node_id]->grad = pTensor;
+    } else {
+        RING_API_ERROR("Graph Bind Grad: Invalid Node ID or Graph not init");
+    }
+}
+
+RING_FUNC(ring_graph_free) {
+    /*
+    ** Usage: ring_graph_free()
+    ** free graph memory
+    */
+    
+    ring_graph_init(pPointer);
+}
+
+/* --- Missing Kernels Implementation --- */
+
+double internal_mse_loss(tensor_t *Pred, tensor_t *Target) {
+    int i;
+    double sum = 0.0;
+    double diff;
+    for(i=0; i<Pred->size; i++) {
+        diff = Pred->data[i] - Target->data[i];
+        sum += diff * diff;
+    }
+    return sum / Pred->size;
+}
+
+/*
+** Fused CrossEntropy (Logits -> Softmax -> Loss)
+** This is CRITICAL for numerical stability.
+*/
+double internal_crossentropy_loss(tensor_t *Pred, tensor_t *Target) {
+    int r, c;
+    double total_loss = 0.0;
+    int batch_size = Pred->rows;
+    int vocab_size = Pred->cols;
+    
+    // Buffer for probabilities (Softmax output)
+    // We can use a small row buffer to save memory or act row-by-row
+    
+    #pragma omp parallel for reduction(+:total_loss) private(c)
+    for(r=0; r<batch_size; r++) {
+        
+        // 1. Compute Softmax for this row ON THE FLY
+        // ------------------------------------------
+        double max_val = -DBL_MAX;
+        double *logit_row = &Pred->data[r * vocab_size];
+        
+        for(c=0; c<vocab_size; c++) {
+            if(logit_row[c] > max_val) max_val = logit_row[c];
+        }
+        
+        double sum_exp = 0.0;
+        // Note: We need exp values to calculate P. 
+        // To avoid allocating a full row buffer, we might do 2 passes?
+        // Or allocate small buffer on stack (vocab is usually small-ish, but dangerous)
+        // Better: Just calculate P for the Target Index! 
+        // We only need log(P_target).
+        
+        for(c=0; c<vocab_size; c++) {
+            sum_exp += exp(logit_row[c] - max_val);
+        }
+        
+        double log_sum_exp = log(sum_exp + 1e-9); // LogSumExp trick with safety
+        
+        // 2. Calculate Loss for Target
+        // Loss = -log(P_target) 
+        //      = -log( exp(logit_target - max) / sum_exp )
+        //      = -( (logit_target - max) - log(sum_exp) )
+        //      = -logit_target + max + log_sum_exp
+        // ------------------------------------------
+        
+        double *target_row = &Target->data[r * vocab_size];
+        
+        for(c=0; c<vocab_size; c++) {
+            if (target_row[c] > 0.5) { // Active Target
+                double logit_t = logit_row[c];
+                double loss = -logit_t + max_val + log_sum_exp;
+                total_loss += loss;
+                break; 
+            }
+        }
+    }
+    
+    return total_loss / batch_size;
+}
+
+void internal_mse_backward(tensor_t *Pred, tensor_t *Target, tensor_t *Grad) {
+    int i;
+    double scale = 2.0 / Pred->size;
+    #pragma omp parallel for if(Pred->size > PARALLEL_THRESHOLD)
+    for(i=0; i<Pred->size; i++) {
+        Grad->data[i] = scale * (Pred->data[i] - Target->data[i]);
+    }
+}
+
+void internal_gelu(tensor_t *T) {
+
+    #ifdef USE_OPENCL
+    // The mathematical operations in GELU are heavy, so the threshold is lower.
+    if (gpu_ready && T->size > 1000000) { // Threshold of 1 million elements
+        if (gpu_gelu(T)) return;
+    }
+    #endif
+    
+    int i;
+    double x, cdf;
+    const double sqrt2 = 1.41421356237;
+    
+    #pragma omp parallel for if(T->size > PARALLEL_THRESHOLD) private(x, cdf)
+    for(i=0; i<T->size; i++) {
+        x = T->data[i];
+        cdf = 0.5 * (1.0 + erf(x / sqrt2));
+        T->data[i] = x * cdf;
+    }
+}
+
+void internal_gelu_prime(tensor_t *T) {
+    int i;
+    double x, cdf, pdf;
+    const double sqrt2 = 1.41421356237;
+    const double sqrt2pi = 2.50662827463;
+    
+    #pragma omp parallel for if(T->size > PARALLEL_THRESHOLD) private(x, cdf, pdf)
+    for(i=0; i<T->size; i++) {
+        x = T->data[i];
+        cdf = 0.5 * (1.0 + erf(x / sqrt2));
+        pdf = exp(-0.5 * x * x) / sqrt2pi;
+        T->data[i] = cdf + x * pdf;
+    }
+}
+
+void internal_crossentropy_backward(tensor_t *Pred, tensor_t *Target, tensor_t *Grad) {
+    int r, c;
+    int rows = Pred->rows;
+    int cols = Pred->cols;
+    double scale = 1.0 / rows;
+    
+    #pragma omp parallel for if(rows > 32) private(c)
+    for(r=0; r<rows; r++) {
+        
+        // 1. Calculating Softmax for this class (very important)
+        // ------------------------------------------------
+        double max_val = -DBL_MAX;
+        double sum_exp = 0.0;
+        double *logit_row = &Pred->data[r * cols];
+        double *target_row = &Target->data[r * cols];
+        double *grad_row = &Grad->data[r * cols];
+        
+        // Find Max
+        for(c=0; c<cols; c++) if(logit_row[c] > max_val) max_val = logit_row[c];
+        
+        // Exponentiate & Sum
+        // Optimization: We can store exps in grad_row temporarily to save memory
+        for(c=0; c<cols; c++) {
+            grad_row[c] = exp(logit_row[c] - max_val); // Temp storage
+            sum_exp += grad_row[c];
+        }
+        
+        double inv_sum = 1.0 / (sum_exp + 1e-9);
+        
+        // ------------------------------------------------
+        
+        // 2. Derivative calculation: (Prob - Target) * Scale
+        // ------------------------------------------------
+        int is_active = 0;
+        for(c=0; c<cols; c++) if(target_row[c] > 0.5) { is_active = 1; break; }
+        
+        if (is_active) {
+            for(c=0; c<cols; c++) {
+                double prob = grad_row[c] * inv_sum; // Final Probability
+                grad_row[c] = scale * (prob - target_row[c]);
+            }
+        } else {
+            // Masking (Padding)
+            memset(grad_row, 0, cols * sizeof(double));
+        }
+    }
+}
+
+void internal_layernorm_backward(tensor_t *dY, tensor_t *X, tensor_t *G, tensor_t *B, tensor_t *dX, tensor_t *dG, tensor_t *dB, double eps) {
+    int r, c, rows = X->rows, cols = X->cols;
+    
+    // 1. Accumulate Gradients for Gamma/Beta (Reduction is safer/faster than Atomic inside loop)
+    // Since rows are many and cols (dim) are few (e.g. 64), we can iterate differently?
+    // No, standard loop with atomic is acceptable for now given current architecture complexity,
+    // BUT let's ensure we are not reading garbage.
+    
+    // Ensure dG and dB are zeroed before accumulation in the main loop call?
+    // Yes, internal_graph_backward zeros all grads first.
+    
+    #pragma omp parallel for if(rows > 32) private(c)
+    for(r=0; r<rows; r++) {
+        double mean = 0, var = 0;
+        double *px = &X->data[r*cols];
+        double *pdy = &dY->data[r*cols];
+        double *pdx = &dX->data[r*cols];
+        
+        // Forward Re-calc
+        for(c=0; c<cols; c++) mean += px[c];
+        mean /= cols;
+        
+        for(c=0; c<cols; c++) { double d = px[c] - mean; var += d*d; }
+        var /= cols;
+        
+        double invStd = 1.0 / sqrt(var + eps);
+
+        // Temp accumulators for this row (to minimize atomic contention)
+        // Note: For dG/dB, we must write to global memory. 
+        // Atomic is the bottleneck here.
+        // Optimization: Calculate dX parts that don't need dG sum first? No.
+        
+        double sum_dy = 0;
+        double sum_dy_x_mu = 0;
+
+        for(c=0; c<cols; c++) {
+            double x_norm = (px[c] - mean) * invStd;
+            double dy = pdy[c];
+            
+            // Accumulate global gradients
+            #pragma omp atomic
+            dG->data[c] += dy * x_norm;
+            
+            #pragma omp atomic
+            dB->data[c] += dy;
+            
+            // Prepare for dX
+            double g = G->data[c];
+            sum_dy += dy * g;
+            sum_dy_x_mu += dy * g * x_norm;
+        }
+
+        // Calculate dX
+        double term1 = invStd;
+        double term2 = invStd / cols; 
+        
+        for(c=0; c<cols; c++) {
+            double x_norm = (px[c] - mean) * invStd;
+            double g = G->data[c];
+            double dy = pdy[c];
+            
+            // Exact formula for LayerNorm Backward
+            pdx[c] = term1 * (dy * g - sum_dy / cols - x_norm * sum_dy_x_mu / cols);
+        }
+    }
+}
+
+void internal_dropout_backward(tensor_t *dY, tensor_t *dX, tensor_t *Mask, double rate) {
+    int i;
+    double scale = 1.0 / (1.0 - rate);
+    
+    #pragma omp parallel for if(dY->size > PARALLEL_THRESHOLD)
+    for(i=0; i<dY->size; i++) {
+        if (Mask->data[i] > 0.5) { // Active
+             dX->data[i] = dY->data[i] * scale;
+        } else { // Dropped
+             dX->data[i] = 0.0;
+        }
+    }
+}
+
+/* --- Updated Optimizer --- */
+void internal_sgd_update(tensor_t *W, tensor_t *dW, double lr) {
+    int i;
+    #pragma omp parallel for if(W->size > PARALLEL_THRESHOLD)
+    for(i=0; i<W->size; i++) {
+        W->data[i] -= lr * dW->data[i];
+    }
+}
+
+void internal_adam_update(tensor_t *W, tensor_t *dW, tensor_t *m, tensor_t *v, 
+                          double lr, double beta1, double beta2, double eps, int t) {
+    int i;
+    double m_hat, v_hat, beta1_t, beta2_t;
+    
+    beta1_t = pow(beta1, t);
+    beta2_t = pow(beta2, t);
+    
+    #pragma omp parallel for if(W->size > PARALLEL_THRESHOLD) private(m_hat, v_hat)
+    for(i=0; i<W->size; i++) {
+        // Update biased first moment
+        m->data[i] = beta1 * m->data[i] + (1.0 - beta1) * dW->data[i];
+        
+        // Update biased second moment
+        v->data[i] = beta2 * v->data[i] + (1.0 - beta2) * dW->data[i] * dW->data[i];
+        
+        // Bias correction
+        m_hat = m->data[i] / (1.0 - beta1_t);
+        v_hat = v->data[i] / (1.0 - beta2_t);
+        
+        // Update weights
+        if (v_hat < 0) v_hat = 0;
+        W->data[i] -= lr * m_hat / (sqrt(v_hat) + eps);
+    }
+}
+
+/* --- More Missing Kernels --- */
+
+void internal_layernorm(tensor_t *X, tensor_t *G, tensor_t *B, double eps) {
+    int r, c, rows = X->rows, cols = X->cols;
+    
+    #pragma omp parallel for if(rows > 32) private(c)
+    for(r=0; r<rows; r++) {
+        double mean = 0, var = 0;
+        double *px = &X->data[r*cols];
+        double invStd;
+        
+        // Calculate mean
+        for(c=0; c<cols; c++) mean += px[c];
+        mean /= cols;
+        
+        // Calculate variance
+        for(c=0; c<cols; c++) var += (px[c]-mean)*(px[c]-mean);
+        var /= cols;
+        
+        // Normalize
+        invStd = 1.0 / sqrt(var + eps);
+        for(c=0; c<cols; c++) {
+            px[c] = ((px[c] - mean) * invStd * G->data[c]) + B->data[c];
+        }
+    }
+}
+
+void internal_slice_rows(tensor_t *Src, tensor_t *Dest, int start_row, int count) {
+    int src_offset_idx = (start_row - 1) * Src->cols;
+    size_t total_elements = (size_t)count * Src->cols;
+    size_t bytes = total_elements * sizeof(double);
+    memcpy(Dest->data, &Src->data[src_offset_idx], bytes);
+}
+
+void internal_insert_rows(tensor_t *Dest, tensor_t *Src, int start_row) {
+    size_t offset_elems = (size_t)(start_row - 1) * Dest->cols;
+    size_t copy_elems   = (size_t)Src->rows * Src->cols;
+    size_t copy_bytes   = copy_elems * sizeof(double);
+    memcpy(&Dest->data[offset_elems], Src->data, copy_bytes);
+}
+
+void internal_dropout(tensor_t *T, double rate, int training) {
+    int i;
+    double scale;
+    
+    if (!training || rate == 0.0) return;
+    
+    scale = 1.0 / (1.0 - rate);
+    
+    for(i=0; i<T->size; i++) {
+        double r = (double)rand() / RAND_MAX;
+        if (r < rate) {
+            T->data[i] = 0.0;
+        } else {
+            T->data[i] *= scale;
+        }
+    }
+}
+
+void internal_attention_forward(tensor_t *Q, tensor_t *K, tensor_t *V, tensor_t *Out, double scale) {
+    int seq = Q->rows;
+    int dim = Q->cols;
+    int i, j, k;
+    
+    #pragma omp parallel private(i, j, k)
+    {
+        double *scores = (double *)malloc(seq * sizeof(double));
+        if(scores) {
+            #pragma omp for
+            for(i=0; i<seq; i++) {
+                double *q_row = &Q->data[i*dim];
+                double *out_row = &Out->data[i*dim];
+                double maxVal = -DBL_MAX;
+                double sum = 0;
+                
+                for(j=0; j<seq; j++) {
+                    double *k_row = &K->data[j*dim];
+                    double dot = 0;
+                    for(k=0; k<dim; k++) dot += q_row[k] * k_row[k];
+                    scores[j] = dot * scale;
+                }
+                
+                for(j=0; j<seq; j++) if(scores[j] > maxVal) maxVal = scores[j];
+                for(j=0; j<seq; j++) {
+                    scores[j] = exp(scores[j] - maxVal);
+                    sum += scores[j];
+                }
+                double invSum = 1.0/sum;
+                for(j=0; j<seq; j++) scores[j] *= invSum;
+                
+                memset(out_row, 0, dim * sizeof(double));
+                for(j=0; j<seq; j++) {
+                    double s = scores[j];
+                    double *v_row = &V->data[j*dim];
+                    for(k=0; k<dim; k++) out_row[k] += s * v_row[k];
+                }
+            }
+            free(scores);
+        }
+    }
+}
+
+void internal_attention_causal(tensor_t *Q, tensor_t *K, tensor_t *V, tensor_t *Out, double scale) {
+    int seq = Q->rows;
+    int dim = Q->cols;
+    int i, j, k;
+    
+    #pragma omp parallel private(i, j, k)
+    {
+        double *scores = (double *)malloc(seq * sizeof(double));
+        if(scores) {
+            #pragma omp for
+            for(i=0; i<seq; i++) {
+                double *q_row = &Q->data[i*dim];
+                double *out_row = &Out->data[i*dim];
+                double maxVal = -DBL_MAX;
+                double sum = 0;
+                
+                for(j=0; j<seq; j++) {
+                    if (j > i) { scores[j] = -1e9; continue; }
+                    double *k_row = &K->data[j*dim];
+                    double dot = 0;
+                    for(k=0; k<dim; k++) dot += q_row[k] * k_row[k];
+                    scores[j] = dot * scale;
+                }
+                
+                for(j=0; j<seq; j++) if(scores[j] > maxVal) maxVal = scores[j];
+                for(j=0; j<seq; j++) {
+                    scores[j] = exp(scores[j] - maxVal);
+                    sum += scores[j];
+                }
+                double invSum = 1.0/sum;
+                for(j=0; j<seq; j++) scores[j] *= invSum;
+                
+                memset(out_row, 0, dim * sizeof(double));
+                for(j=0; j<seq; j++) {
+                    double s = scores[j];
+                    if(s < 1e-9) continue;
+                    double *v_row = &V->data[j*dim];
+                    for(k=0; k<dim; k++) out_row[k] += s * v_row[k];
+                }
+            }
+            free(scores);
+        }
+    }
+}
+
+void internal_embedding_forward(tensor_t *Emb, tensor_t *Ind, tensor_t *Out) {
+    int total = Ind->size;
+    int dim = Emb->cols;
+    int vocab = Emb->rows;
+    int i;
+    
+    #pragma omp parallel for if(total > 32)
+    for(i=0; i<total; i++) {
+        int idx = (int)Ind->data[i];
+        idx = idx - 1; // Convert from Ring indexing (1-based) to C indexing (0-based)
+        if (idx < 0) idx = 0;
+        if (idx >= vocab) idx = vocab - 1;
+        memcpy(&Out->data[i * dim], &Emb->data[idx * dim], dim * sizeof(double));
+    }
+}
+
+void internal_embedding_backward(tensor_t *dOut, tensor_t *Ind, tensor_t *dEmb) {
+    int total = Ind->size;
+    int dim = dEmb->cols;
+    int i, j;
+    
+    // Serial to avoid race conditions
+    for(i=0; i<total; i++) {
+        int idx = (int)Ind->data[i];
+        idx = idx - 1; // Convert from Ring indexing (1-based) to C indexing (0-based)
+        if (idx < 0 || idx >= dEmb->rows) continue;
+        
+        double *g_src = &dOut->data[i * dim];
+        double *g_dst = &dEmb->data[idx * dim];
+        
+        for(j=0; j<dim; j++) g_dst[j] += g_src[j];
+    }
+}
+
+double internal_mean_global(tensor_t *T) {
+    double sum = 0;
+    int i;
+    #pragma omp parallel for reduction(+:sum) if(T->size > PARALLEL_THRESHOLD)
+    for(i=0; i<T->size; i++) sum += T->data[i];
+    return sum / T->size;
+}
+
+void internal_argmax_rowwise(tensor_t *T, tensor_t *R) {
+    int r, c;
+    #pragma omp parallel for if(T->rows > 64) private(c)
+    for(r=0; r<T->rows; r++) {
+        double maxVal = -DBL_MAX;
+        int maxIdx = 1;
+        int offset = r * T->cols;
+        for(c=0; c<T->cols; c++) {
+            if(T->data[offset+c] > maxVal) {
+                maxVal = T->data[offset+c];
+                maxIdx = c + 1;
+            }
+        }
+        R->data[r] = (double)maxIdx;
+    }
+}
+
+double internal_sum_squares(tensor_t *T) {
+    double sum = 0.0;
+    int i;
+    #pragma omp parallel for reduction(+:sum) if(T->size > 2000)
+    for(i = 0; i < T->size; i++) {
+        sum += T->data[i] * T->data[i];
+    }
+    return sum;
+}
+
+void internal_clip_tensor(tensor_t *T, double min_val, double max_val) {
+    int i;
+    #pragma omp parallel for if(T->size > 1000)
+    for(i = 0; i < T->size; i++) {
+        if (T->data[i] > max_val) T->data[i] = max_val;
+        else if (T->data[i] < min_val) T->data[i] = min_val;
+    }
+}
+
+RING_FUNC(ring_tensor_print_stats) {
+    tensor_t *t = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    double min = DBL_MAX, max = -DBL_MAX, sum = 0;
+    int i;
+    for(i=0; i<t->size; i++) {
+        if(t->data[i] < min) min = t->data[i];
+        if(t->data[i] > max) max = t->data[i];
+        sum += fabs(t->data[i]);
+    }
+    printf("Tensor Stats: Min=%.4f Max=%.4f AvgAbs=%.4f\n", min, max, sum/t->size);
+}
+
 /* --- INIT --- */
 RING_LIBINIT {
     RING_API_REGISTER("tensor_init", ring_tensor_init);
@@ -2685,6 +4416,8 @@ RING_LIBINIT {
     RING_API_REGISTER("tensor_matmul_batch", ring_tensor_matmul_batch); 
     RING_API_REGISTER("tensor_set", ring_tensor_set);
     RING_API_REGISTER("tensor_get", ring_tensor_get);
+    RING_API_REGISTER("tensor_copy_data", ring_tensor_copy_data);
+    RING_API_REGISTER("tensor_print_stats", ring_tensor_print_stats);
     
     RING_API_REGISTER("tensor_get_data_ptr", ring_tensor_get_data_ptr);
     
@@ -2759,6 +4492,7 @@ RING_LIBINIT {
     // In-place load functions
     ring_vm_funcregister("tensor_load_inplace", ring_tensor_load_inplace);
     ring_vm_funcregister("tensor_load_fp32_inplace", ring_tensor_load_fp32_inplace);
+    ring_vm_funcregister("graph_run_buffered", ring_graph_run_buffered);
 
     RING_API_REGISTER("tensor_clip_global_norm", ring_tensor_clip_global_norm);
     RING_API_REGISTER("tensor_clip_tensor", ring_tensor_clip_tensor);
@@ -2784,6 +4518,24 @@ RING_LIBINIT {
 
     RING_API_REGISTER("tensor_set_one_hot_ptr", ring_tensor_set_one_hot_ptr);
 
+    // --- GRAPH ENGINE ---
+    RING_API_REGISTER("graph_init", ring_graph_init);
+    RING_API_REGISTER("graph_node", ring_graph_node);
+    RING_API_REGISTER("graph_add_node", ring_graph_node); // Alias
+    RING_API_REGISTER("graph_set_input", ring_graph_set_input);
+    RING_API_REGISTER("graph_get_output", ring_graph_get_output);
+    RING_API_REGISTER("graph_forward", ring_graph_forward);
+    RING_API_REGISTER("graph_backward", ring_graph_backward);
+    RING_API_REGISTER("graph_set_optimizer", ring_graph_set_optimizer);
+    RING_API_REGISTER("graph_run", ring_graph_run);
+    RING_API_REGISTER("graph_update", ring_graph_update);
+    RING_API_REGISTER("graph_bind_memory", ring_graph_bind_memory);
+    RING_API_REGISTER("graph_bind_grad", ring_graph_bind_grad);
+    RING_API_REGISTER("graph_free", ring_graph_free);
+
+    #ifdef USE_OPENCL
+        init_opencl();
+    #endif
 
     #ifdef _OPENMP
     omp_set_num_threads(omp_get_num_procs());

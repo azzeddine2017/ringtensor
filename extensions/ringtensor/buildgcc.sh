@@ -11,10 +11,6 @@ mkdir -p "$LIB_DIR"
 
 echo "🏗 Building RingTensor..."
 
-# 2️⃣ ترجمة ring_tensor.c
-gcc -c -fpic -O2 "$SRC/ring_tensor.c" -I "$INCLUDE_DIR"
-
-# 3️⃣ إنشاء مكتبة مشتركة
-gcc -shared -o "$LIB_DIR/libring_tensor.so" "$SRC/ring_tensor.o"
+gcc -shared -o libring_tensor.so -O3 -fPIC -fopenmp -DUSE_OPENCL ring_tensor.c -I ../../language/include -L ../../lib -lring -lOpenCL
 
 echo "✅ RingTensor built successfully!"
