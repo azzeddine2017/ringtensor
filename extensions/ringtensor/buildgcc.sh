@@ -11,6 +11,9 @@ mkdir -p "$LIB_DIR"
 
 echo "🏗 Building RingTensor..."
 
-gcc -shared -o libring_tensor.so -O3 -fPIC -fopenmp -DUSE_OPENCL ring_tensor.c -I ../../language/include -L ../../lib -lring -lOpenCL
-
+gcc -shared -o libring_tensor.so -O3 -fPIC -fopenmp \
+    ring_tensor.c \
+    -I ../../language/include \
+    -L ../../lib -lring -lOpenCL
+    
 echo "✅ RingTensor built successfully!"

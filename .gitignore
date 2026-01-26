@@ -1,0 +1,126 @@
+# RingTensor .gitignore
+
+# Compiled Object files
+*.o
+*.obj
+*.lo
+*.slo
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Compiled Static libraries
+*.a
+*.lib
+*.la
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Windows specific
+*.exp
+*.ilk
+*.pdb
+*.idb
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.vcxproj.filters
+*.vcxproj.user
+
+# Build directories
+build/
+bin/
+obj/
+Debug/
+Release/
+x64/
+x86/
+ipch/
+.vs/
+
+# Ring specific
+*.ringo
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# IDE specific
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Log files
+*.log
+
+# Model files (optional - uncomment if you don't want to track models)
+# *.bin
+# *.model
+# *.weights
+
+# Test outputs
+test_output/
+*.test
+
+# Documentation build
+docs/_build/
+docs/.doctrees/
+
+# Package manager
+.ringpm/
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Coverage reports
+*.gcov
+*.gcda
+*.gcno
+coverage/
+
+# Profiling data
+*.prof
+gmon.out
+
+# Core dumps
+core
+core.*
+
+# Environment
+.env
+.env.local
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Archives
+*.zip
+*.tar.gz
+*.rar
+*.7z
+
+# Keep these files
+!lib/OpenCL.lib
+!lib/OpenCL.def
+!lib/OpenCL.exp

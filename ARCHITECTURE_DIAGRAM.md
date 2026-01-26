@@ -15,7 +15,7 @@ RingTensor has evolved from a collection of separate files into a unified, high-
 │  │  graph_init()                                                         │  │
 │  │  graph_set_optimizer(OPTIMIZER_ADAM)                                  │  │
 │  │  id_emb = graph_node(OP_EMBEDDING, id_w, id_in)                       │  │
-│  │  graph_run(epochs, lr)  ──► Runs entirely in C!                       │  │
+│  │  graph_run(epochs, lr, clipNorm)  ──► Runs entirely in C!             │  │
 │  └───────────────────────────────────────────────────────────────────────┘  │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘

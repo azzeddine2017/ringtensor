@@ -5,11 +5,11 @@ aPackageInfo = [
 	:developer = "Azzeddine Remmal",
 	:email = "azzeddine.remmal@gmail.com",
 	:license = "MIT License",
-	:version = "1.3.1",
+	:version = "1.3.2",
 	:ringversion = "1.25",
 	:versions = 	[
 		[
-			:version = "1.3.1",
+			:version = "1.3.2",
 			:branch = "master"
 		]
 	],
@@ -23,9 +23,16 @@ aPackageInfo = [
 	:files = 	[
 		"main.ring",
 		"README.md",
-		"READMEv1.2.1.md",
+		"CONTRIBUTING.md",
 		"OPCODES_REFERENCE.md",
 		"ARCHITECTURE_DIAGRAM.md",
+		"LICENSE.md",
+		"QUICKSTART.md",
+		"CHANGELOG.md",
+		"API_REFERENCE.md",
+		"DOCUMENTATION.md",
+		"EXAMPLES.md",
+		"SECURITY.md",
 		"setup.ring"
 	],
 	:ringfolderfiles = 	[
