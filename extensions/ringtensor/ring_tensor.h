@@ -1,7 +1,6 @@
 /*
 ** RingTensor Extension - Header (Refactored Architecture)
 ** Architecture: Core/Shell Separation + Graph Engine Support
-** النواة (Internal Kernels) + القشرة (Ring Wrappers) + محرك الجراف
 */
 
 #ifndef RING_TENSOR_H
@@ -310,6 +309,7 @@ RING_FUNC(ring_tensor_crossentropy_backward);
 /* 7. Utilities */
 RING_FUNC(ring_tensor_get_cores);
 RING_FUNC(ring_tensor_set_threads);
+RING_FUNC(ring_tensor_set_gpu_threshold);
 
 
 RING_FUNC(ring_tensor_set_from_list);

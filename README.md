@@ -1,10 +1,10 @@
-# ⚡ RingTensor Extension (v1.3.0)
+# ⚡ RingTensor Extension (v1.3.1)
 
 **RingTensor** is a high-performance, memory-resident C extension for the Ring programming language. It serves as the low-level mathematical engine for **RingML**, specifically optimized for Deep Learning, Transformers (GPT/BERT), and massive data processing.
 
 > **Architecture:** RingTensor implements a **Hybrid Execution Model**. It utilizes **OpenMP** for Multi-Core CPU processing and **OpenCL** for GPU acceleration, automatically switching based on workload size.
 
-## 🚀 What's New in v1.3.0
+## 🚀 What's New in v1.3.1
 - **GPU Acceleration (OpenCL)**: Native support for Intel HD, NVIDIA, and AMD GPUs. Automatically offloads heavy matrix operations (`MatMul`, `Transpose`, `GELU`) to the GPU.
 - **Binary Persistence**: Save and load tensors instantly using raw binary dumps (supports both Double-64bit and Float-32bit modes).
 - **Advanced NLP Kernels**: Added **GELU** activation (GPT standard), **Batch Attention**, and Causal Masking.

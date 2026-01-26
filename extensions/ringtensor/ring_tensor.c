@@ -17,6 +17,10 @@
 #ifdef USE_OPENCL
 #include "opencl_stub.h"
 
+// Default threshold: 5 Million operations
+// If matrix ops > this, use GPU. Else use CPU.
+static long long GPU_THRESHOLD = 5000000;
+
 static cl_context       clContext = NULL;
 static cl_command_queue clQueue   = NULL;
 static cl_kernel        clMatMulKernel = NULL;
@@ -899,7 +903,7 @@ void internal_matmul(tensor_t *A, tensor_t *B, tensor_t *C) {
      #ifdef USE_OPENCL
     // Raising the threshold to 5 million operations to ensure that the benefit of the GPU covers the cost of transfer
     // (For powerful cards, it can be reduced, but for the HD 5500 this number is safe)
-    if (gpu_ready && operations > 1000000) {
+    if (gpu_ready && operations > GPU_THRESHOLD) {
         if (gpu_matmul(A, B, C)) {
             return; // Done by GPU
         }
@@ -958,7 +962,7 @@ void internal_transpose(tensor_t *A, tensor_t *R) {
 
     #ifdef USE_OPENCL
     // Rotation requires significant memory movement; the GPU is excellent here.
-    if (gpu_ready && A->size > 1000000) { //Threshold of 5 million elements
+    if (gpu_ready && A->size > GPU_THRESHOLD) { 
         if (gpu_transpose(A, R)) return;
     }
     #endif
@@ -1399,6 +1403,24 @@ RING_FUNC(ring_tensor_set_threads) {
     #ifdef _OPENMP
     omp_set_num_threads(n);
     #endif
+}
+
+/*
+** Set GPU Switch Threshold
+** Input: Number (Operations count, e.g. 1000000)
+*/
+RING_FUNC(ring_tensor_set_gpu_threshold) {
+    if (RING_API_PARACOUNT != 1) {
+        RING_API_ERROR(RING_API_MISS1PARA);
+        return;
+    }
+    
+    double val = RING_API_GETNUMBER(1);
+    
+    // Safety check
+    if (val < 0) val = 0;
+    
+    GPU_THRESHOLD = (long long)val;
 }
 
 /*
@@ -2038,7 +2060,7 @@ RING_FUNC(ring_tensor_gelu) {
     tensor_t *T = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
 
     #ifdef USE_OPENCL
-    if (gpu_ready && T->size > 1000000) {
+    if (gpu_ready && T->size > GPU_THRESHOLD) {
         if (gpu_gelu(T)) return;
     }
     #endif
@@ -3975,7 +3997,7 @@ void internal_gelu(tensor_t *T) {
 
     #ifdef USE_OPENCL
     // The mathematical operations in GELU are heavy, so the threshold is lower.
-    if (gpu_ready && T->size > 1000000) { // Threshold of 1 million elements
+    if (gpu_ready && T->size > GPU_THRESHOLD) { 
         if (gpu_gelu(T)) return;
     }
     #endif
@@ -4480,6 +4502,7 @@ RING_LIBINIT {
 
     RING_API_REGISTER("tensor_get_cores", ring_tensor_get_cores);
     RING_API_REGISTER("tensor_set_threads", ring_tensor_set_threads);
+    RING_API_REGISTER("tensor_set_gpu_threshold", ring_tensor_set_gpu_threshold);
 
     RING_API_REGISTER("tensor_set_from_list", ring_tensor_set_from_list);
     RING_API_REGISTER("tensor_set_one_hot", ring_tensor_set_one_hot);
