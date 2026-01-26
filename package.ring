@@ -43,7 +43,6 @@ aPackageInfo = [
 		"extensions/ringtensor/ARCHITECTURE_DIAGRAM.md",
 		"extensions/ringtensor/buildclang.sh",
 		"extensions/ringtensor/buildgcc.sh",
-		"extensions/ringtensor/buildvc_max_sped_x64.bat",
 		"extensions/ringtensor/include/opencl_stub.h",
 		"extensions/ringtensor/lib/OpenCL.def",
 		"extensions/ringtensor/lib/OpenCL.exp",
