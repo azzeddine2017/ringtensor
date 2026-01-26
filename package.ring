@@ -26,7 +26,7 @@ aPackageInfo = [
 		"CONTRIBUTING.md",
 		"OPCODES_REFERENCE.md",
 		"ARCHITECTURE_DIAGRAM.md",
-		"LICENSE.md",
+		"LICENSE",
 		"QUICKSTART.md",
 		"CHANGELOG.md",
 		"API_REFERENCE.md",
