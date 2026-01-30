@@ -344,4 +344,6 @@ RING_FUNC(ring_tensor_attention_multihead_backward);
 RING_FUNC(ring_tensor_set_one_hot_ptr);
 RING_FUNC(ring_graph_run_buffered);
 
+RING_FUNC(ring_tensor_to_list);
+
 #endif

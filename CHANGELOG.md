@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.3.3] - 2026-01-30
+
+### Added
+- Added mug.txt file
+- Added mug_gpu_demo.ring file
+- Added tensor_to_list() function
+- Added tensor_from_list() function
+
+### Changed
+- Updated README.md with clearer installation instructions
+
+### Fixed
+- Minor typos in documentation
+- Consistency in version numbering across files
+
+---
+
 ## [1.3.2] - 2026-01-26
 
 ### Added

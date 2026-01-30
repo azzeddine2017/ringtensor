@@ -5,11 +5,11 @@ aPackageInfo = [
 	:developer = "Azzeddine Remmal",
 	:email = "azzeddine.remmal@gmail.com",
 	:license = "MIT License",
-	:version = "1.3.2",
+	:version = "1.3.3",
 	:ringversion = "1.25",
 	:versions = 	[
 		[
-			:version = "1.3.2",
+			:version = "1.3.3",
 			:branch = "master"
 		]
 	],
@@ -64,6 +64,8 @@ aPackageInfo = [
 		"extensions/ringtensor/tests/test_3d_physics.ring",
 		"extensions/ringtensor/tests/test_adam.ring",
 		"extensions/ringtensor/tests/test_core.ring",
+		"extensions/ringtensor/tests/mug_gpu_demo.ring",
+		"extensions/ringtensor/tests/mug.txt",
 		"extensions/ringtensor/tests/test_memory.ring",
 		"extensions/ringtensor/tests/test_simple.ring",
 		"extensions/ringtensor/tests/test_sum_col.ring",

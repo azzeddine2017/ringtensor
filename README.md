@@ -2,7 +2,7 @@
 
 <div align="center">
 
-![Version](https://img.shields.io/badge/version-1.3.2-blue.svg)
+![Version](https://img.shields.io/badge/version-1.3.3-blue.svg)
 ![Ring](https://img.shields.io/badge/Ring-1.25+-green.svg)
 ![License](https://img.shields.io/badge/license-MIT-orange.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)
@@ -70,7 +70,7 @@ RingTensor implements a **Hybrid Execution Model** with intelligent workload dis
 
 ---
 
-## 🚀 What's New in v1.3.2
+## 🚀 What's New in v1.3.3
 
 ### New Features
 

@@ -4430,6 +4430,35 @@ RING_FUNC(ring_tensor_print_stats) {
     printf("Tensor Stats: Min=%.4f Max=%.4f AvgAbs=%.4f\n", min, max, sum/t->size);
 }
 
+/* 
+** Export to List (Fast)
+** Converts Tensor to a flat Ring List [v1, v2, v3, ...]
+** Critical for passing data to GUI or other libraries.
+*/
+RING_FUNC(ring_tensor_to_list) {
+    tensor_t *T;
+    List *pList;
+    int i;
+
+    if (RING_API_PARACOUNT != 1) {
+        RING_API_ERROR(RING_API_MISS1PARA);
+        return;
+    }
+
+    T = (tensor_t *)RING_API_GETCPOINTER(1, RING_VM_POINTER_TENSOR);
+    
+    // Create new Ring List
+    pList = RING_API_NEWLIST;
+    
+    // Turbo Copy
+    for(i = 0; i < T->size; i++) {
+        ring_list_adddouble(pList, T->data[i]);
+    }
+    
+    RING_API_RETLIST(pList);
+}
+
+
 /* --- INIT --- */
 RING_LIBINIT {
     RING_API_REGISTER("tensor_init", ring_tensor_init);
@@ -4540,7 +4569,8 @@ RING_LIBINIT {
     RING_API_REGISTER("tensor_attention_multihead_backward", ring_tensor_attention_multihead_backward);
 
     RING_API_REGISTER("tensor_set_one_hot_ptr", ring_tensor_set_one_hot_ptr);
-
+    RING_API_REGISTER("tensor_to_list", ring_tensor_to_list);
+    
     // --- GRAPH ENGINE ---
     RING_API_REGISTER("graph_init", ring_graph_init);
     RING_API_REGISTER("graph_node", ring_graph_node);
