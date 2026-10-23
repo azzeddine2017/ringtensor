@@ -10,6 +10,8 @@ else
     LoadLib("libring_tensor.so")
 ok
 
+Load "tensor.ring"
+
 # OpCodes (Sync with C)
 RT_OP_INPUT       = 1
 RT_OP_WEIGHT      = 2
